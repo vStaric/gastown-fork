@@ -1663,7 +1663,7 @@ type NudgeOpts struct {
 // expected session, fall back to the session's first pane instead of the active
 // pane that a bare session target would select.
 func (t *Tmux) canonicalPaneTarget(session, pane string) string {
-	fallback := session + ":0.0"
+	fallback := firstPaneTarget(session)
 	if pane == "" {
 		return fallback
 	}
@@ -1738,7 +1738,7 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 
 	// Resolve the correct target: in multi-pane sessions, find the pane
 	// running the agent rather than sending to the focused pane.
-	target := session + ":0.0"
+	target := firstPaneTarget(session)
 	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
 		target = t.canonicalPaneTarget(session, agentPane)
 	}
@@ -2247,10 +2247,10 @@ func (t *Tmux) findAgentPaneByScan(session string) (string, error) {
 
 // GetPaneID returns the pane identifier for a session's first pane.
 // Returns a pane ID like "%0" that can be used with RespawnPane.
-// Targets pane 0 explicitly to be consistent with GetPaneCommand,
-// GetPanePID, and GetPaneWorkDir.
+// Targets the first window explicitly (see firstPaneTarget) to be consistent
+// with GetPaneCommand, GetPanePID, and GetPaneWorkDir.
 func (t *Tmux) GetPaneID(session string) (string, error) {
-	out, err := t.run("display-message", "-t", session+":0.0", "-p", "#{pane_id}")
+	out, err := t.run("display-message", "-t", firstPaneTarget(session), "-p", "#{pane_id}")
 	if err != nil {
 		return "", err
 	}
@@ -2262,10 +2262,10 @@ func (t *Tmux) GetPaneID(session string) (string, error) {
 }
 
 // GetPaneWorkDir returns the current working directory of a pane.
-// Targets pane 0 explicitly to avoid returning the active pane's
-// working directory in multi-pane sessions.
+// Targets the first window explicitly (see firstPaneTarget) rather than a bare
+// session target, which would follow the active window in multi-window sessions.
 func (t *Tmux) GetPaneWorkDir(session string) (string, error) {
-	out, err := t.run("display-message", "-t", session+":0.0", "-p", "#{pane_current_path}")
+	out, err := t.run("display-message", "-t", firstPaneTarget(session), "-p", "#{pane_current_path}")
 	if err != nil {
 		return "", err
 	}
@@ -3317,6 +3317,24 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("timeout waiting for runtime prompt")
+}
+
+// firstPaneTarget returns a tmux target for the first window of a session.
+//
+// It uses tmux's ":^" (first window) specifier rather than a literal index
+// because base-index is commonly set to 1 (a near-universal .tmux.conf
+// setting). A hardcoded "<session>:0.0" target fails on such servers with
+// "can't find window: 0", which silently breaks nudge delivery: the poller
+// drains the queue, injection fails, the nudge is requeued, and the agent
+// looks healthy while receiving nothing (hq-9bpm).
+//
+// No pane suffix is appended: send-keys rejects both ".^" ("can't find pane:
+// ^") and a literal ".0" under pane-base-index 1, whereas a bare ":^" targets
+// the window's active pane and is valid on every server. Callers that must
+// reach a specific pane in a multi-pane session resolve its pane ID first
+// (see FindAgentPane) and pass that instead.
+func firstPaneTarget(session string) string {
+	return session + ":^"
 }
 
 // DefaultReadyPromptPrefix is the Claude Code prompt prefix used for idle detection.

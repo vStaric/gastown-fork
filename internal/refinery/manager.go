@@ -289,6 +289,14 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
 
+	// Record the agent's pane_id for ZFC-compliant liveness checks and nudge
+	// targeting (gt-qmsx). Without it FindAgentPane falls back to a pane scan,
+	// which returns "" for a single-pane session, leaving nudge delivery on the
+	// literal-index target that is invalid under base-index=1 (hq-9bpm).
+	if paneID, err := t.GetPaneID(sessionID); err == nil {
+		_ = t.SetEnvironment(sessionID, "GT_PANE_ID", paneID)
+	}
+
 	// Apply theme (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "refinery", "")
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "refinery", "refinery")

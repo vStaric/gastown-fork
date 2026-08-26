@@ -1973,7 +1973,9 @@ func TestCanonicalPaneTargetResolvesAndFallsBack(t *testing.T) {
 	defer func() { _ = tm.KillSession(otherSession) }()
 
 	time.Sleep(200 * time.Millisecond)
-	fallback := sessionName + ":0.0"
+	// The fallback must not hardcode index 0: base-index/pane-base-index are
+	// commonly 1, and a literal "<session>:0.0" target is then invalid (hq-9bpm).
+	fallback := firstPaneTarget(sessionName)
 	if got := tm.canonicalPaneTarget(sessionName, ""); got != fallback {
 		t.Errorf("empty pane target = %q, want %q", got, fallback)
 	}
@@ -1985,14 +1987,24 @@ func TestCanonicalPaneTargetResolvesAndFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPaneID target: %v", err)
 	}
-	if got := tm.canonicalPaneTarget(sessionName, paneID); got != fallback {
-		t.Errorf("live pane target = %q, want %q", got, fallback)
+	// A live pane resolves to its real window.pane indices, whatever the
+	// server's base-index happens to be — not to the fallback.
+	wantLive, err := tm.run("display-message", "-t", paneID, "-p",
+		"#{session_name}:#{window_index}.#{pane_index}")
+	if err != nil {
+		t.Fatalf("display-message for live pane: %v", err)
+	}
+	wantLive = strings.TrimSpace(wantLive)
+	if got := tm.canonicalPaneTarget(sessionName, paneID); got != wantLive {
+		t.Errorf("live pane target = %q, want %q", got, wantLive)
 	}
 
 	otherPane, err := tm.GetPaneID(otherSession)
 	if err != nil {
 		t.Fatalf("GetPaneID other: %v", err)
 	}
+	// A pane belonging to a different session must not be targeted; the
+	// resolver falls back rather than crossing sessions.
 	if got := tm.canonicalPaneTarget(sessionName, otherPane); got != fallback {
 		t.Errorf("cross-session pane target = %q, want %q", got, fallback)
 	}
