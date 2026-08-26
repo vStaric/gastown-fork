@@ -355,6 +355,42 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 	}
 }
 
+// TestAutoCloseExcludesAgentBeads pins the fix for hq-9cbg. Reap() and Scan()
+// already exclude agent beads, but AutoClose() protected only
+// gt:standing-orders/gt:keep/gt:role/gt:rig — so the 7-day staleness sweep
+// closed 43 gt:agent identity beads in one run. Agent beads are long-lived
+// state, not work: "no updates in 7 days" means the agent was quiet.
+//
+// The visible damage is await-event's backoff. Consumers resolve an agent bead
+// with `status != closed`; once closed, no agent can pass --agent-bead, the
+// idle counter never persists, and exponential backoff is pinned at
+// --backoff-base forever.
+func TestAutoCloseExcludesAgentBeads(t *testing.T) {
+	data, err := os.ReadFile("reaper.go")
+	if err != nil {
+		t.Fatalf("read reaper.go: %v", err)
+	}
+	source := string(data)
+	start := strings.Index(source, "func AutoClose(")
+	if start == -1 {
+		t.Fatal("could not locate func AutoClose( in reaper.go")
+	}
+	body := source[start:]
+	if end := strings.Index(body[1:], "\nfunc "); end != -1 {
+		body = body[:end+1]
+	}
+
+	labelFilter := "WHERE l.label IN ("
+	idx := strings.Index(body, labelFilter)
+	if idx == -1 {
+		t.Fatal("AutoClose() no longer has a label-exclusion filter; agent beads may be unprotected")
+	}
+	line := body[idx : idx+strings.Index(body[idx:], ")")]
+	if !strings.Contains(line, "'gt:agent'") {
+		t.Fatalf("AutoClose() must exclude 'gt:agent' beads (hq-9cbg); label filter was:\n%s", line)
+	}
+}
+
 func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{

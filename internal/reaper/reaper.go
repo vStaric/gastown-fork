@@ -718,6 +718,14 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 // AutoClose closes issues that have been open with no updates past staleAge.
 // Excludes P0/P1 priority, epics, hooked/pinned issues, standing-order labels,
 // and issues with active dependencies.
+//
+// gt:agent beads are excluded (hq-9cbg): they are long-lived agent IDENTITY /
+// state records, not work items, so "no updates in 7 days" means the agent was
+// quiet — not that the bead is stale. Auto-closing them silently breaks every
+// consumer that resolves an agent bead by `status != closed`, most visibly
+// await-event's idle/backoff tracking: with no resolvable --agent-bead the idle
+// counter cannot persist, so exponential backoff is pinned at --backoff-base
+// forever and a quiet refinery burns one agent turn per base interval.
 func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (*AutoCloseResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
@@ -738,7 +746,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')
+			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent')
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
