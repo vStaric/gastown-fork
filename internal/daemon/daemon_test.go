@@ -986,3 +986,83 @@ func TestIsRigOperational_DockedRig(t *testing.T) {
 	}
 	t.Logf("Docked rig check returned: operational=%v, reason=%q", operational, reason)
 }
+
+// TestStalledAtTurnBoundary_RequiresCycleFrozen covers the detector's cycle-progression
+// logic (hq-lm16). The pane checks need a live tmux and are exercised separately;
+// these cases all return before reaching them.
+func TestStalledAtTurnBoundary_RequiresCycleFrozen(t *testing.T) {
+	newDaemon := func() *Daemon {
+		return &Daemon{lastCycleSeen: make(map[string]cycleSighting)}
+	}
+
+	t.Run("first sighting never reports a stall", func(t *testing.T) {
+		d := newDaemon()
+		if d.stalledAtTurnBoundary("hq-deacon", 100, time.Minute) {
+			t.Error("first sighting reported a stall; it has no prior sample to compare against")
+		}
+	})
+
+	t.Run("advancing cycle is not a stall and resets the clock", func(t *testing.T) {
+		d := newDaemon()
+		// Seed a sighting that is already old enough to trip the grace period.
+		d.lastCycleSeen["hq-deacon"] = cycleSighting{cycle: 100, seen: time.Now().Add(-time.Hour)}
+
+		if d.stalledAtTurnBoundary("hq-deacon", 101, time.Minute) {
+			t.Error("cycle advanced 100->101 but was reported stalled")
+		}
+		got := d.lastCycleSeen["hq-deacon"]
+		if got.cycle != 101 {
+			t.Errorf("recorded cycle = %d, want 101", got.cycle)
+		}
+		if time.Since(got.seen) > time.Minute {
+			t.Error("seen timestamp was not reset when the cycle advanced")
+		}
+	})
+
+	t.Run("frozen cycle inside the grace period is not yet a stall", func(t *testing.T) {
+		d := newDaemon()
+		d.lastCycleSeen["hq-deacon"] = cycleSighting{cycle: 100, seen: time.Now().Add(-10 * time.Second)}
+
+		if d.stalledAtTurnBoundary("hq-deacon", 100, time.Hour) {
+			t.Error("reported a stall before the grace period elapsed")
+		}
+	})
+
+	t.Run("frozen cycle does not overwrite the original sighting time", func(t *testing.T) {
+		// Regression guard: if a repeat sighting refreshed `seen`, the grace period
+		// would never elapse and the detector could never fire.
+		d := newDaemon()
+		original := time.Now().Add(-30 * time.Second)
+		d.lastCycleSeen["hq-deacon"] = cycleSighting{cycle: 100, seen: original}
+
+		_ = d.stalledAtTurnBoundary("hq-deacon", 100, time.Hour)
+
+		if got := d.lastCycleSeen["hq-deacon"]; !got.seen.Equal(original) {
+			t.Errorf("seen was refreshed on an unchanged cycle (%v -> %v); grace could never elapse",
+				original, got.seen)
+		}
+	})
+
+	t.Run("sessions are tracked independently", func(t *testing.T) {
+		d := newDaemon()
+		if d.stalledAtTurnBoundary("hq-deacon", 5, time.Minute) {
+			t.Error("unexpected stall on first sighting for hq-deacon")
+		}
+		if d.stalledAtTurnBoundary("wqp-witness", 5, time.Minute) {
+			t.Error("unexpected stall on first sighting for wqp-witness")
+		}
+		if len(d.lastCycleSeen) != 2 {
+			t.Errorf("tracked %d sessions, want 2 — per-session state is being shared", len(d.lastCycleSeen))
+		}
+	})
+
+	t.Run("nil map is initialised rather than panicking", func(t *testing.T) {
+		d := &Daemon{} // lastCycleSeen deliberately nil
+		if d.stalledAtTurnBoundary("hq-deacon", 1, time.Minute) {
+			t.Error("unexpected stall on first sighting")
+		}
+		if d.lastCycleSeen == nil {
+			t.Error("lastCycleSeen was not initialised")
+		}
+	})
+}

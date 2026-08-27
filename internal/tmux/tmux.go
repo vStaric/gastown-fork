@@ -3531,6 +3531,29 @@ func (t *Tmux) IsIdle(session string) bool {
 	return false
 }
 
+// ReadyPromptLine returns the content of the LAST prompt line in the pane, with
+// the prompt prefix stripped — i.e. whatever is sitting in the agent's composer.
+// Empty means the composer is empty.
+//
+// Anchors to the LAST match deliberately: the prompt glyph also appears in
+// scrollback (agent prose, echoed commands, delivered nudges), so an any-match
+// read reports staged text on an empty composer. Returns an error if no prompt
+// line is present at all.
+func (t *Tmux) ReadyPromptLine(session string) (string, error) {
+	lines, err := t.CapturePaneLines(session, 15)
+	if err != nil {
+		return "", err
+	}
+	promptPrefix := readyPromptPrefixForSession(t, session)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if matchesPromptPrefix(lines[i], promptPrefix) {
+			trimmed := strings.TrimSpace(lines[i])
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, strings.TrimSpace(promptPrefix))), nil
+		}
+	}
+	return "", fmt.Errorf("no prompt line found in %s", session)
+}
+
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"

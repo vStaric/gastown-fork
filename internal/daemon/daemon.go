@@ -67,6 +67,13 @@ type Daemon struct {
 	// mayor/daemon.json. Checked by isPatrolActive alongside patrolConfig.
 	disabledPatrols map[string]bool
 
+	// Turn-boundary stall detection (hq-lm16): an agent can park with its next
+	// instruction staged-but-unsubmitted while its heartbeat stays FRESH — the
+	// heartbeat thread lives, the patrol loop is dead. Detecting that needs cycle
+	// PROGRESSION across ticks, so remember what we last saw.
+	stallMu       sync.Mutex
+	lastCycleSeen map[string]cycleSighting
+
 	// Mass death detection: track recent session deaths
 	deathsMu     sync.Mutex
 	recentDeaths []sessionDeath
@@ -1583,8 +1590,53 @@ func (d *Daemon) checkDeaconHeartbeat() {
 
 	age := hb.Age()
 
-	// If heartbeat is fresh (< 5 min), nothing to do
+	// If heartbeat is fresh (< 5 min), the heartbeat THREAD is alive — but that is
+	// not evidence the patrol LOOP is running. Check for a turn-boundary stall
+	// before returning, otherwise this watchdog stays silent through exactly the
+	// failure it exists to catch (hq-lm16 / hq-fdiz).
 	if hb.IsFresh() {
+		// TWO independent signals, because neither alone is sufficient:
+		//   - cycle frozen: catches a wedged loop, but MISSES a stall where the
+		//     counter keeps advancing (observed 1918->1920 through a stall)
+		//   - composer staged: directly measures the observed signature, but must
+		//     be sampled more than once — staging is a discrete post-turn event
+		//     with an empty-composer window first (6 bytes, then 25 four seconds
+		//     later), so one probe can read healthy through a real stall
+		// The composer path therefore requires TWO agreeing samples spanning that
+		// window before it fires (hq-om8h, hq-lm16).
+		staged := d.composerStaged(sessionName)
+		if staged {
+			time.Sleep(stagingWindowDebounce)
+			staged = d.composerStaged(sessionName)
+		}
+		if staged || d.stalledAtTurnBoundary(sessionName, hb.Cycle, deaconStallGrace) {
+			signal := "cycle frozen"
+			if staged {
+				signal = "composer staged across two samples"
+			}
+			d.logger.Printf("STALLED DEACON: heartbeat fresh (cycle %d) but %s with an idle pane - waking",
+				hb.Cycle, signal)
+			// Fresh-text wake ONLY, ONE dose. NudgeSession types a new message and
+			// submits that. Do NOT reach for C-j here: on this signature it CLEARS
+			// the staged continuation without submitting, discarding queued work,
+			// and Escape+Enter is inert (both measured on hq-fdiz).
+			if err := d.tmux.NudgeSession(sessionName,
+				"STALL_RECOVERY: your patrol loop has not advanced. Continue patrolling."); err != nil {
+				d.logger.Printf("Error waking stalled Deacon: %v", err)
+				return
+			}
+			// Verify recovery by a TURN STARTING, never by the composer going
+			// empty. A cleared composer is not proof of submission — that is the
+			// false-success class that bit an earlier fix of mine, and exactly what
+			// C-j does (clears without submitting). Log-only: one dose per
+			// detection, so a failed wake is reported and retried on a later tick
+			// rather than re-nudged now (hq-om8h dose discipline).
+			time.Sleep(stallRecoveryVerifyDelay)
+			if d.tmux.IsIdle(sessionName) {
+				d.logger.Printf("STALL RECOVERY UNCONFIRMED: %s still idle %s after wake - no turn started",
+					sessionName, stallRecoveryVerifyDelay)
+			}
+		}
 		return
 	}
 
@@ -3095,4 +3147,107 @@ func (d *Daemon) dispatchQueuedWork() {
 	} else if len(out) > 0 {
 		d.logger.Printf("Scheduler dispatch: %s", string(out))
 	}
+}
+
+// deaconStallGrace is how long the deacon's heartbeat cycle counter may sit
+// unchanged, with a fresh heartbeat and an idle pane, before we treat it as
+// parked at a turn boundary and wake it (hq-lm16).
+//
+// Chosen against measured behaviour, not guessed: the observed stalls recurred
+// with gaps of 13m, 13m, 23m, 5m and ~7m, and each one persisted until an
+// external wake — so a stall does not self-resolve, and the cost of waiting is
+// linear in lost patrol cycles. 6 minutes is longer than a normal cycle
+// (~13 min between reports was the SLOW case, and a healthy cycle bumps the
+// counter well inside that) while still catching the 5-minute-gap case. It is
+// also just above HeartbeatStaleThreshold (5m), so this check and the existing
+// stale-heartbeat path do not race on the same tick.
+const deaconStallGrace = 6 * time.Minute
+
+// stagingWindowDebounce is the re-sample delay for the composer signal. Staging is
+// a discrete POST-TURN event: measured "idle, nothing staged" and then staged text
+// 4 SECONDS later, so a single sample landing in that window sees a healthy idle
+// agent during a real stall. 8s clears the measured window with margin (hq-om8h).
+const stagingWindowDebounce = 8 * time.Second
+
+// stallRecoveryVerifyDelay is how long to wait after a wake before checking that a
+// turn actually started. Recovery is confirmed by a busy indicator appearing, never
+// by the composer emptying — a cleared composer is not proof of submission.
+const stallRecoveryVerifyDelay = 10 * time.Second
+
+// cycleSighting records when a session's heartbeat cycle counter was last seen
+// to change, for turn-boundary stall detection (hq-lm16).
+type cycleSighting struct {
+	cycle int64
+	seen  time.Time
+}
+
+// stalledAtTurnBoundary reports whether a session looks parked at a turn
+// boundary: its heartbeat is FRESH, but its cycle counter has not advanced for
+// longer than the grace period while the session is alive and not working.
+//
+// This is the failure the existing watchdog cannot see. It returns early on a
+// fresh heartbeat (daemon.go, checkDeaconHealth), which is exactly this stall's
+// signature — observed 8 times in one session with "Health: FRESH" throughout,
+// the cycle counter even advancing 1918->1920 across a stall, while the deacon
+// did no work and only an external wake recovered it.
+//
+// Deliberately conservative. It requires ALL of:
+//   - the session exists
+//   - the cycle counter is unchanged since at least stallGrace ago
+//   - the pane shows no busy indicator (not mid-turn)
+//
+// The pane check matters because of a trap boot measured: staging is a discrete
+// POST-TURN event with a brief empty-composer window first, so a single sample
+// can read healthy straight through a stall. Requiring "idle AND cycle frozen
+// across two ticks" samples across that window instead of once.
+func (d *Daemon) stalledAtTurnBoundary(sessionName string, cycle int64, stallGrace time.Duration) bool {
+	d.stallMu.Lock()
+	if d.lastCycleSeen == nil {
+		d.lastCycleSeen = make(map[string]cycleSighting)
+	}
+	prev, had := d.lastCycleSeen[sessionName]
+	now := time.Now()
+	if !had || prev.cycle != cycle {
+		d.lastCycleSeen[sessionName] = cycleSighting{cycle: cycle, seen: now}
+		d.stallMu.Unlock()
+		return false // first sighting, or the loop is progressing
+	}
+	frozenFor := now.Sub(prev.seen)
+	d.stallMu.Unlock()
+
+	if frozenFor < stallGrace {
+		return false
+	}
+
+	// Cycle frozen long enough. Confirm the session is alive but not working —
+	// a busy pane is progressing, just slowly.
+	if hasSession, err := d.tmux.HasSession(sessionName); err != nil || !hasSession {
+		return false
+	}
+	return d.tmux.IsIdle(sessionName)
+}
+
+// composerStaged reports whether a session is idle with text sitting in its
+// composer — the directly-measured signature of a turn-boundary stall, verified
+// byte-identical across 8 occurrences (hq-om8h): no busy indicator present AND a
+// prompt line longer than the bare prompt.
+//
+// This is INDEPENDENT of the heartbeat cycle counter on purpose. The counter is
+// not a liveness proxy — it was observed advancing 1918->1920 straight THROUGH a
+// stall — so a purely cycle-based check can miss a real stall entirely. This path
+// catches the case the counter hides.
+//
+// Callers must sample this more than once before concluding anything. Staging is a
+// discrete POST-TURN event: measured "idle, nothing staged" and then staged text
+// 4 SECONDS later, so a single probe landing in that window sees a healthy idle
+// agent during a real stall.
+func (d *Daemon) composerStaged(sessionName string) bool {
+	if !d.tmux.IsIdle(sessionName) {
+		return false // mid-turn: queued text here is normal, not a stall
+	}
+	line, err := d.tmux.ReadyPromptLine(sessionName)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(line) != ""
 }
