@@ -1481,6 +1481,17 @@ func (t *Tmux) sendEnterVerified(target string) error {
 		verifyLines    = 5 // capture last N lines for comparison
 	)
 
+	// Exit tmux copy/scroll mode first. While a pane is in copy mode tmux
+	// consumes keys with its OWN keytable instead of passing them to the
+	// process, so a submit keystroke can be silently swallowed. Escape does NOT
+	// clear this — "send-keys -X cancel" does, which is why the nudge path has
+	// done exactly this since line ~1800 while the submit path did not. Cheap,
+	// idempotent, and a no-op when the pane is already normal (hq-fdiz).
+	if inMode, _ := t.run("display-message", "-p", "-t", target, "#{pane_in_mode}"); strings.TrimSpace(inMode) == "1" {
+		_, _ = t.run("send-keys", "-t", target, "-X", "cancel")
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	// Snapshot pane content before Enter so we can detect processing.
 	preSnapshot, preErr := t.CapturePane(target, verifyLines)
 
