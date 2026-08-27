@@ -1512,8 +1512,15 @@ func (t *Tmux) sendEnterVerified(target string) error {
 		// Content unchanged — Enter was not processed. Escalate to C-j
 		// rather than repeating the keystroke that just failed: in the
 		// agent TUI, Enter can be swallowed entirely (inserting a newline
-		// in the composer instead of submitting) while C-j always submits,
-		// so retrying Enter can never converge (hq-9bpm).
+		// in the composer instead of submitting), so retrying Enter can
+		// never converge (hq-9bpm).
+		//
+		// C-j is NOT a guaranteed submit. On an ALREADY-STALLED pane it can
+		// clear the composer without starting a turn, discarding the staged
+		// text (hq-fdiz). It is used here only after we typed the text
+		// ourselves and observed our own Enter no-op, and the final check
+		// below requires evidence a turn actually started — so a clear-only
+		// outcome is reported as a failure rather than a delivery.
 		submitKey := "Enter"
 		if retry > 0 {
 			submitKey = "C-j"
@@ -1529,11 +1536,36 @@ func (t *Tmux) sendEnterVerified(target string) error {
 	// Final verification after last retry.
 	time.Sleep(500 * time.Millisecond)
 	postSnapshot, err := t.CapturePane(target, verifyLines)
-	if err != nil || postSnapshot != preSnapshot {
-		return nil // Can't verify or content changed — consider success.
+	if err != nil {
+		return nil // Can't verify — consider success (old best-effort behaviour).
+	}
+	if postSnapshot != preSnapshot {
+		// Content changed, but "changed" is NOT "submitted". A C-j on a stalled
+		// agent TUI can CLEAR the composer without starting a turn, destroying the
+		// staged message while making the pane look freshly idle — measured on a
+		// stalled deacon: composer 25 bytes -> 6, no spinner at +8/+15/+25/+40s, no
+		// new turn, heartbeat frozen (hq-fdiz). Treating that as success is how a
+		// discarded message gets reported as delivered, so require evidence a turn
+		// actually started before claiming success.
+		if turnStartedAfterSubmit(postSnapshot) {
+			return nil
+		}
+		return fmt.Errorf("submit not confirmed after %d retries: pane changed but no turn started (message may have been discarded)", maxRetries)
 	}
 
 	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged", maxRetries)
+}
+
+// turnStartedAfterSubmit reports whether a captured pane shows an agent actually
+// working — a busy indicator such as a spinner or "esc to interrupt". A cleared
+// composer alone is not evidence of submission (hq-fdiz).
+func turnStartedAfterSubmit(pane string) bool {
+	for _, line := range strings.Split(pane, "\n") {
+		if hasBusyIndicator(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // adaptiveTextDelay returns the post-text-delivery delay for a message.
