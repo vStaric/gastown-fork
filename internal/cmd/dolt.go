@@ -324,11 +324,12 @@ After migration, 'bd mol wisp list' will work and agent lifecycle
 }
 
 var (
-	doltLogLines     int
-	doltLogFollow    bool
-	doltMigrateDry   bool
-	doltCleanupDry   bool
-	doltCleanupForce bool
+	doltLogLines       int
+	doltLogFollow      bool
+	doltMigrateDry     bool
+	doltCleanupDry     bool
+	doltCleanupForce   bool
+	doltCleanupOffline bool
 
 	doltMigrateWispsDry bool
 	doltMigrateWispsDB  string
@@ -367,6 +368,7 @@ func init() {
 
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupDry, "dry-run", false, "Preview what would be removed without making changes")
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupForce, "force", false, "Remove databases even if they have user tables")
+	doltCleanupCmd.Flags().BoolVar(&doltCleanupOffline, "offline", false, "Remove orphan database DIRECTORIES from disk (requires the server to be stopped)")
 	doltLogsCmd.Flags().IntVarP(&doltLogLines, "lines", "n", 50, "Number of lines to show")
 	doltLogsCmd.Flags().BoolVarP(&doltLogFollow, "follow", "f", false, "Follow log output")
 
@@ -1069,10 +1071,87 @@ func runDoltInit(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// orphanDirPatterns are the directory-name prefixes that identify throwaway test
+// databases. Deliberately a fixed allowlist rather than "anything unreferenced":
+// offline cleanup deletes directories with the server down, so it cannot consult
+// the server to confirm what is live. Only names that could never be a production
+// database are eligible.
+var orphanDirPatterns = []string{
+	"testdb_", "beads_t", "beads_pt", "beads_vr", "doctest_", "doctortest_",
+}
+
+// runDoltCleanupOffline removes orphan database DIRECTORIES from disk while the
+// server is stopped.
+//
+// This exists because the online path is a dead end above 50 orphans (hq-om1b):
+// plain cleanup refuses without --force, --force refuses above the SQL cap and
+// prescribes a manual "rm -rf" inside .dolt-data/ — which agents are forbidden to
+// run (CLAUDE.md: never rm -rf .dolt-data, never touch Dolt-internal .dolt/
+// files). So the prescription was unusable by the only parties who hit the limit,
+// and the orphan count could only grow. gt now does the deletion itself, against
+// a fixed name allowlist, with the server verified down.
+func runDoltCleanupOffline(townRoot string) error {
+	running, pid, err := doltserver.IsRunning(townRoot)
+	if err == nil && running {
+		return fmt.Errorf("refusing offline cleanup: Dolt server is running (PID %d) — run 'gt dolt stop' first, then 'gt dolt cleanup --offline', then 'gt dolt start'", pid)
+	}
+
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", dataDir, err)
+	}
+
+	var targets []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		for _, prefix := range orphanDirPatterns {
+			if strings.HasPrefix(e.Name(), prefix) {
+				targets = append(targets, e.Name())
+				break
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		fmt.Printf("%s No orphan database directories found in %s\n", style.Success.Render("✓"), dataDir)
+		return nil
+	}
+
+	fmt.Printf("Found %d orphan database directory(ies) in %s:\n", len(targets), dataDir)
+	for _, t := range targets {
+		fmt.Printf("  %s\n", style.Dim.Render(t))
+	}
+	if doltCleanupDry {
+		fmt.Printf("\nDry run: no changes made.\n")
+		return nil
+	}
+
+	removed := 0
+	for _, t := range targets {
+		if err := os.RemoveAll(filepath.Join(dataDir, t)); err != nil {
+			fmt.Printf("  %s %s: %v\n", style.Warning.Render("⚠"), t, err)
+			continue
+		}
+		removed++
+	}
+	fmt.Printf("\n%s Removed %d of %d orphan directory(ies). Run 'gt dolt start' to bring the server back up.\n",
+		style.Success.Render("✓"), removed, len(targets))
+	return nil
+}
+
 func runDoltCleanup(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Offline sweep: works on DIRECTORIES with the server stopped, so it does not
+	// consult the server and is not subject to the SQL-cleanup cap (hq-om1b).
+	if doltCleanupOffline {
+		return runDoltCleanupOffline(townRoot)
 	}
 
 	orphans, err := doltserver.FindOrphanedDatabases(townRoot)
@@ -1124,9 +1203,11 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  The server is likely overloaded. SQL cleanup would take hours.\n\n")
 		fmt.Printf("  Instead, stop the server and clean the filesystem:\n\n")
 		fmt.Printf("    gt dolt stop\n")
-		fmt.Printf("    cd %s/.dolt-data && rm -rf testdb_* beads_t* beads_pt* beads_vr* doctest_* doctortest_*\n", townRoot)
+		fmt.Printf("    gt dolt cleanup --offline\n")
 		fmt.Printf("    gt dolt start\n\n")
 		fmt.Printf("  This is safe — orphan databases have no production data.\n")
+		fmt.Printf("  (--offline deletes the directories itself; do NOT hand-run rm -rf inside\n")
+		fmt.Printf("   .dolt-data/, which risks Dolt-internal corruption. Add --dry-run to preview.)\n")
 		return fmt.Errorf("too many orphans (%d) for SQL cleanup — see instructions above", len(orphans))
 	}
 
