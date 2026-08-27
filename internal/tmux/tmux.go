@@ -1225,8 +1225,10 @@ func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr e
 	if debounceMs > 0 {
 		time.Sleep(time.Duration(debounceMs) * time.Millisecond)
 	}
-	// Send Enter separately - more reliable than appending to send-keys
-	_, retErr = t.run("send-keys", "-t", session, "Enter")
+	// Send the submit keystroke separately - more reliable than appending to
+	// send-keys. Verified so a swallowed Enter escalates to C-j instead of
+	// silently stranding the text in the composer (hq-9bpm).
+	retErr = t.sendEnterVerified(session)
 	return retErr
 }
 
@@ -1466,7 +1468,9 @@ func (t *Tmux) dismissRewindMode(target string) {
 // stream rather than a separate submit action.
 //
 // After sending Enter, polls the pane content with exponential backoff. If the
-// content hasn't changed (Enter wasn't processed), retries the Enter keystroke.
+// content hasn't changed (Enter wasn't processed), retries — first with Enter
+// once more (covers the buffering race), then with C-j, which submits in the
+// agent TUI even when Enter is swallowed into the composer (hq-9bpm).
 // Max 3 retries before returning an error.
 //
 // Falls back to best-effort (no verification) if pane capture fails.
@@ -1505,9 +1509,17 @@ func (t *Tmux) sendEnterVerified(target string) error {
 			return nil
 		}
 
-		// Content unchanged — Enter may not have been processed. Retry.
-		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
-			return fmt.Errorf("send Enter (retry %d): %w", retry+1, err)
+		// Content unchanged — Enter was not processed. Escalate to C-j
+		// rather than repeating the keystroke that just failed: in the
+		// agent TUI, Enter can be swallowed entirely (inserting a newline
+		// in the composer instead of submitting) while C-j always submits,
+		// so retrying Enter can never converge (hq-9bpm).
+		submitKey := "Enter"
+		if retry > 0 {
+			submitKey = "C-j"
+		}
+		if _, err := t.run("send-keys", "-t", target, submitKey); err != nil {
+			return fmt.Errorf("send %s (retry %d): %w", submitKey, retry+1, err)
 		}
 
 		// Exponential backoff: 500ms → 1000ms → 2000ms
