@@ -330,6 +330,7 @@ var (
 	doltCleanupDry     bool
 	doltCleanupForce   bool
 	doltCleanupOffline bool
+	doltCleanupOnly    string
 
 	doltMigrateWispsDry bool
 	doltMigrateWispsDB  string
@@ -369,6 +370,7 @@ func init() {
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupDry, "dry-run", false, "Preview what would be removed without making changes")
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupForce, "force", false, "Remove databases even if they have user tables")
 	doltCleanupCmd.Flags().BoolVar(&doltCleanupOffline, "offline", false, "Remove orphan database DIRECTORIES from disk (requires the server to be stopped)")
+	doltCleanupCmd.Flags().StringVar(&doltCleanupOnly, "only", "", "Only consider orphans matching this glob (e.g. 'testdb_*'); narrows the target set so a verified set is removable without --force")
 	doltLogsCmd.Flags().IntVarP(&doltLogLines, "lines", "n", 50, "Number of lines to show")
 	doltLogsCmd.Flags().BoolVarP(&doltLogFollow, "follow", "f", false, "Follow log output")
 
@@ -1159,7 +1161,39 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("finding orphaned databases: %w", err)
 	}
 
+	// --only narrows the target set BEFORE the safety gates. Both gates exist to
+	// stop a blanket sweep from taking something real: the 81% check fires when
+	// most databases look orphaned (usually a metadata problem, not real orphans),
+	// and the SQL cap stops an hours-long DROP loop. Neither is a reason to block
+	// an EXPLICITLY NAMED pattern the operator has verified — and --force is the
+	// wrong tool for that, because it widens the blast radius to everything
+	// flagged, which is how a live database nearly got dropped (hq-east).
+	//
+	// With --only, the operator states the pattern, the command shows exactly what
+	// matched, and anything outside it is untouchable for that invocation. That is
+	// a scalpel; --force is not (hq-9dgx).
+	if doltCleanupOnly != "" {
+		var kept []doltserver.OrphanedDatabase
+		for _, o := range orphans {
+			matched, matchErr := filepath.Match(doltCleanupOnly, o.Name)
+			if matchErr != nil {
+				return fmt.Errorf("invalid --only pattern %q: %w", doltCleanupOnly, matchErr)
+			}
+			if matched {
+				kept = append(kept, o)
+			}
+		}
+		skipped := len(orphans) - len(kept)
+		orphans = kept
+		fmt.Printf("%s --only %q: %d orphan(s) matched, %d excluded from this run\n",
+			style.Bold.Render("→"), doltCleanupOnly, len(kept), skipped)
+	}
+
 	if len(orphans) == 0 {
+		if doltCleanupOnly != "" {
+			fmt.Printf("%s No orphaned databases matched %q\n", style.Bold.Render("✓"), doltCleanupOnly)
+			return nil
+		}
 		fmt.Printf("%s No orphaned databases found in .dolt-data/\n", style.Bold.Render("✓"))
 		return nil
 	}
