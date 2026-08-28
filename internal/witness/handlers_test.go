@@ -2818,3 +2818,125 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
 	}
 }
+
+// TestNotifyMayorSlotOpen_EmptyQueueEmitsSchedulerOpenNotSlotOpen pins the
+// epic-completion routing: a free slot with NOTHING slingable must NOT emit
+// SLOT_OPEN (the notice implies actionable work), and instead emits SCHEDULER_OPEN
+// carrying queued_ready=0.
+//
+// Written while investigating hq-e8w5, which reported ~20 SLOT_OPEN notices into an
+// empty queue and proposed adding a QueuedReady==0 check before the SLOT_OPEN emit.
+// That check already exists one guard earlier — schedulerOpenAfterSlot tests
+// !Paused && Capacity.Free > 0 && QueuedReady == 0 and routes to SCHEDULER_OPEN —
+// so SLOT_OPEN is unreachable on an empty queue and the proposed change would have
+// been dead code. This test exists to make that routing explicit, so the same fix
+// is not proposed again.
+func TestNotifyMayorSlotOpen_EmptyQueueEmitsSchedulerOpenNotSlotOpen(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	townRoot, workDir := setupSlotOpenTestTown(t)
+
+	prevRecovery := slotOpenRecoveryCheck
+	prevDecision := slotOpenDecisionForNotify
+	prevScheduler := runSchedulerForSlotOpen
+	t.Cleanup(func() {
+		slotOpenRecoveryCheck = prevRecovery
+		slotOpenDecisionForNotify = prevDecision
+		runSchedulerForSlotOpen = prevScheduler
+	})
+
+	slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+		return `{"verdict":"SAFE_TO_NUKE"}`, nil
+	}
+	slotOpenDecisionForNotify = func(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+		return polecat.SlotReuseDecision{Reusable: true}
+	}
+	runSchedulerForSlotOpen = func(gotTownRoot string) (slotOpenSchedulerResult, error) {
+		var result slotOpenSchedulerResult
+		result.Before.Capacity.Max = 10
+		result.Before.Capacity.Free = 1 // capacity available
+		result.Before.QueuedReady = 0   // but nothing to sling
+		result.Before.Paused = false    // and not paused
+		result.After = result.Before
+		result.Ran = true
+		result.Dispatched = 0
+		return result, nil
+	}
+
+	notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+
+	events := readMayorEvents(t, townRoot)
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want exactly one SCHEDULER_OPEN", events)
+	}
+	if events[0].Type != "SCHEDULER_OPEN" {
+		t.Fatalf("event type = %q, want SCHEDULER_OPEN — SLOT_OPEN implies actionable work", events[0].Type)
+	}
+	if got := events[0].Payload["queued_ready"]; got != "0" {
+		t.Errorf("queued_ready = %q, want \"0\"", got)
+	}
+}
+
+// TestNotifyMayorSlotOpen_UnusableSchedulerStatusSuppressesMayor covers the actual
+// hq-e8w5 cause: when scheduler status is unavailable, every capacity guard is
+// vacuous and SLOT_OPEN fired unconditionally.
+//
+// Two ways to get there, both live: the scheduler trigger errors (zero-valued
+// result), or the town runs direct dispatch (max_polecats=-1, so Capacity.Max is
+// not positive — the state queue-town was actually in). With no usable status we
+// cannot tell whether a slot is actionable, so stay silent rather than guess.
+func TestNotifyMayorSlotOpen_UnusableSchedulerStatusSuppressesMayor(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func() (slotOpenSchedulerResult, error)
+	}{
+		{
+			name: "direct dispatch reports no positive capacity",
+			setup: func() (slotOpenSchedulerResult, error) {
+				var result slotOpenSchedulerResult
+				result.Before.Capacity.Max = 0 // max_polecats=-1
+				result.Before.QueuedReady = 0
+				result.After = result.Before
+				result.Ran = true
+				return result, nil
+			},
+		},
+		{
+			name: "scheduler trigger error leaves a zero-valued result",
+			setup: func() (slotOpenSchedulerResult, error) {
+				return slotOpenSchedulerResult{}, fmt.Errorf("scheduler unavailable")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", t.TempDir())
+			townRoot, workDir := setupSlotOpenTestTown(t)
+
+			prevRecovery := slotOpenRecoveryCheck
+			prevDecision := slotOpenDecisionForNotify
+			prevScheduler := runSchedulerForSlotOpen
+			t.Cleanup(func() {
+				slotOpenRecoveryCheck = prevRecovery
+				slotOpenDecisionForNotify = prevDecision
+				runSchedulerForSlotOpen = prevScheduler
+			})
+
+			slotOpenRecoveryCheck = func(workDir, rigName, polecatName string) (string, error) {
+				return `{"verdict":"SAFE_TO_NUKE"}`, nil
+			}
+			slotOpenDecisionForNotify = func(workDir, townRoot, rigName, polecatName, exitType string) polecat.SlotReuseDecision {
+				return polecat.SlotReuseDecision{Reusable: true}
+			}
+			runSchedulerForSlotOpen = func(gotTownRoot string) (slotOpenSchedulerResult, error) {
+				return tc.setup()
+			}
+
+			notifyMayorSlotOpen(workDir, "gastown", "guzzle", string(ExitTypeCompleted))
+
+			if events := readMayorEvents(t, townRoot); len(events) != 0 {
+				t.Fatalf("events = %+v, want none — scheduler status was unusable, so actionability is unknown", events)
+			}
+		})
+	}
+}

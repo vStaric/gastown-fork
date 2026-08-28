@@ -915,8 +915,12 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		})
 		return
 	}
-	if result, err := runSchedulerForSlotOpen(townRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "witness: SLOT_OPEN scheduler trigger failed for %s/%s: %v\n", rigName, polecatName, err)
+	schedulerResult, schedulerErr := runSchedulerForSlotOpen(townRoot)
+	if schedulerErr != nil {
+		fmt.Fprintf(os.Stderr, "witness: SLOT_OPEN scheduler trigger failed for %s/%s: %v\n", rigName, polecatName, schedulerErr)
+	}
+	result := schedulerResult
+	if schedulerErr != nil {
 		if result.Dispatched > 0 {
 			return
 		}
@@ -928,7 +932,23 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 	} else if status, ok := schedulerOpenAfterSlot(result); ok {
 		notifyMayorSchedulerOpen(townRoot, rigName, polecatName, exitType, status)
 		return
-	} else if status := schedulerStatusAfterSlot(result); status.Capacity.Max > 0 && (status.Paused || status.Capacity.Free <= 0) {
+	} else if status := schedulerStatusAfterSlot(result); status.Paused || (status.Capacity.Max > 0 && status.Capacity.Free <= 0) {
+		return
+	}
+
+	if !schedulerStatusIsUsable(schedulerResult) {
+		// Scheduler status unavailable: either the trigger errored (leaving a
+		// zero-valued result) or the town runs direct dispatch (max_polecats=-1,
+		// so Capacity.Max is not positive). Both make every capacity guard above
+		// vacuous, and SLOT_OPEN then fired unconditionally — ~20 notices into an
+		// empty queue after an epic finished (hq-e8w5).
+		//
+		// With no usable status we cannot tell whether a slot is actionable, so
+		// stay silent rather than notify on a guess. A genuinely actionable slot
+		// still reaches the mayor via the SCHEDULER_OPEN and dispatch paths above,
+		// which do have real status.
+		fmt.Fprintf(os.Stderr, "witness: SLOT_OPEN suppressed for %s/%s: scheduler status unavailable (max=%d, ran=%v)\n",
+			rigName, polecatName, schedulerStatusAfterSlot(schedulerResult).Capacity.Max, schedulerResult.Ran)
 		return
 	}
 
@@ -962,6 +982,15 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 func schedulerOpenAfterSlot(result slotOpenSchedulerResult) (slotOpenSchedulerStatus, bool) {
 	status := schedulerStatusAfterSlot(result)
 	return status, !status.Paused && status.Capacity.Max > 0 && status.Capacity.Free > 0 && status.QueuedReady == 0
+}
+
+// schedulerStatusIsUsable reports whether a scheduler result carries capacity
+// information the SLOT_OPEN guards can actually reason about. A failed trigger
+// yields a zero-valued result, and direct-dispatch towns (max_polecats=-1) report
+// no positive Max — in both cases every "Capacity.Max > 0" guard is vacuous
+// (hq-e8w5).
+func schedulerStatusIsUsable(result slotOpenSchedulerResult) bool {
+	return schedulerStatusAfterSlot(result).Capacity.Max > 0
 }
 
 func schedulerStatusAfterSlot(result slotOpenSchedulerResult) slotOpenSchedulerStatus {
