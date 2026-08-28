@@ -72,6 +72,7 @@ type maintainDBInfo struct {
 	name        string
 	commitCount int
 	hasBackup   bool
+	backupName  string
 }
 
 func runMaintain(cmd *cobra.Command, args []string) error {
@@ -109,7 +110,8 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 		if count, err := maintainCountCommits(config, dbName); err == nil {
 			info.commitCount = count
 		}
-		info.hasBackup = maintainHasBackup(config.DataDir, dbName)
+		info.backupName = maintainBackupName(config.DataDir, dbName)
+		info.hasBackup = info.backupName != ""
 		dbInfos = append(dbInfos, info)
 	}
 
@@ -157,14 +159,22 @@ func runMaintain(cmd *cobra.Command, args []string) error {
 	// are safe on a running server per Tim Sehn (2026-02-28).
 
 	// Phase 2: Backup.
-	if backupCount > 0 {
+	// Run the phase unconditionally: when NOTHING is configured we still need to
+	// say so. Gating on backupCount > 0 meant a town with zero backups printed
+	// nothing at all about backups (hq-vrli).
+	if len(dbInfos) > 0 {
 		fmt.Printf("\n%s Backing up databases...\n", style.Bold.Render("●"))
 		for _, db := range dbInfos {
 			if !db.hasBackup {
+				// Say so. Silently skipping is how the town's most important
+				// database went unbacked 271 times without anyone being told
+				// (hq-vrli). gt never runs `dolt backup add`, so an unconfigured
+				// database stays unconfigured forever unless a human notices.
+				fmt.Printf("  %s %s: NO BACKUP CONFIGURED — not backed up (configure with: cd %s && dolt backup add <name> <url>)\n",
+					style.Warning.Render("!"), db.name, filepath.Join(config.DataDir, db.name))
 				continue
 			}
-			backupName := db.name + "-backup"
-			if err := maintainBackupSync(config.DataDir, db.name, backupName); err != nil {
+			if err := maintainBackupSync(config.DataDir, db.name, db.backupName); err != nil {
 				fmt.Printf("  %s %s: backup failed: %v\n", style.Warning.Render("!"), db.name, err)
 			} else {
 				fmt.Printf("  %s %s backed up\n", style.Bold.Render("✓"), db.name)
@@ -249,7 +259,17 @@ func maintainCountCommits(config *doltserver.Config, dbName string) (int, error)
 }
 
 // maintainHasBackup checks if a database has a <name>-backup remote configured.
-func maintainHasBackup(dataDir, dbName string) bool {
+// maintainBackupName returns the name of the database's configured Dolt backup
+// target, or "" if it has none.
+//
+// It reads the ACTUAL name from `dolt backup` rather than assuming one. The
+// previous code looked for a hardcoded "<db>-backup", which nothing creates — the
+// real targets in this town are named "backup_export" — so it never matched, every
+// database looked unbacked, and the backup phase was skipped entirely while
+// reporting nothing. Verified: `dolt backup sync watch_queue_api-backup` returns
+// "backup 'watch_queue_api-backup' not found" while `dolt backup sync
+// backup_export` succeeds (hq-vrli).
+func maintainBackupName(dataDir, dbName string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -259,16 +279,17 @@ func maintainHasBackup(dataDir, dbName string) bool {
 
 	output, err := cmd.Output()
 	if err != nil {
-		return false
+		return ""
 	}
 
-	backupName := dbName + "-backup"
 	for _, line := range strings.Split(string(output), "\n") {
-		if strings.TrimSpace(line) == backupName {
-			return true
+		// `dolt backup` lists one target per line; some builds append the URL.
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			return fields[0]
 		}
 	}
-	return false
+	return ""
 }
 
 // maintainBackupSync runs dolt backup sync for a single database.
