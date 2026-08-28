@@ -71,6 +71,10 @@ type Daemon struct {
 	// instruction staged-but-unsubmitted while its heartbeat stays FRESH — the
 	// heartbeat thread lives, the patrol loop is dead. Detecting that needs cycle
 	// PROGRESSION across ticks, so remember what we last saw.
+	// backupNames maps database -> its actual configured Dolt backup target name,
+	// populated during detection so the sync uses the real name (hq-vrli).
+	backupNames map[string]string
+
 	stallMu       sync.Mutex
 	lastCycleSeen map[string]cycleSighting
 

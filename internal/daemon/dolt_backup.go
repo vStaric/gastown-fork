@@ -85,7 +85,10 @@ func (d *Daemon) syncDoltBackups() {
 	synced := 0
 	var failures []string
 	for _, db := range databases {
-		backupName := db + "-backup"
+		backupName := d.backupNames[db]
+		if backupName == "" {
+			backupName = db + "-backup" // defensive; detection should have set it
+		}
 		if err := d.syncBackup(dataDir, db, backupName); err != nil {
 			d.logger.Printf("dolt_backup: %s: sync failed: %v", db, err)
 			failures = append(failures, db)
@@ -203,14 +206,44 @@ func (d *Daemon) discoverDatabasesWithBackups(dataDir string) []string {
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
-		// Check if this directory has a <name>-backup configured
-		backupName := name + "-backup"
-		if d.hasBackupRemote(dataDir, name, backupName) {
+		// Read the ACTUAL configured backup name. Assuming "<name>-backup" meant
+		// this patrol matched nothing — the real targets are named "backup_export"
+		// — so it logged "no databases with backup remotes found" every 15 minutes
+		// while two databases DID have targets, and gt's own backup patrol had
+		// never run (hq-vrli). The 135M of api backups on disk came from bd, not
+		// from here.
+		if backupName := d.backupRemoteName(dataDir, name); backupName != "" {
 			databases = append(databases, name)
+			if d.backupNames == nil {
+				d.backupNames = make(map[string]string)
+			}
+			d.backupNames[name] = backupName
 		}
 	}
 
 	return databases
+}
+
+// backupRemoteName returns the name of the database's configured Dolt backup
+// target, or "" when it has none. Reads the real name rather than assuming one.
+func (d *Daemon) backupRemoteName(dataDir, db string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "dolt", "backup")
+	cmd.Dir = dataDir + "/" + db
+	util.SetDetachedProcessGroup(cmd)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 // hasBackupRemote checks if a database has the specified backup remote configured.
