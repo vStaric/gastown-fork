@@ -22,8 +22,12 @@ var (
 func init() {
 	rootCmd.AddCommand(nudgePollerCmd)
 	nudgePollerCmd.Flags().StringVar(&nudgePollerIntervalFlag, "interval", nudge.DefaultPollInterval, "Poll interval (e.g., 10s, 30s)")
+	nudgePollerCmd.Flags().BoolVar(&nudgePollerSpawnDetached, "spawn-detached", false, "Internal: spawn the real poller and exit, so it reparents to init")
+	_ = nudgePollerCmd.Flags().MarkHidden("spawn-detached")
 	nudgePollerCmd.Flags().StringVar(&nudgePollerIdleFlag, "idle-timeout", nudge.DefaultIdleTimeout, "How long to wait for agent idle before skipping")
 }
+
+var nudgePollerSpawnDetached bool
 
 var nudgePollerCmd = &cobra.Command{
 	Use:    "nudge-poller <session>",
@@ -47,6 +51,19 @@ Not intended for direct user invocation.`,
 
 func runNudgePoller(cmd *cobra.Command, args []string) error {
 	sessionName := args[0]
+
+	// Intermediate stage of the double-fork: start the real poller, print its pid,
+	// and exit immediately so init inherits it. Without this the poller stays a
+	// child of whoever spawned it, and a long-lived spawner (the daemon) never
+	// reaps it — that is how a poller sat defunct for 25+ hours (hq-7onb).
+	if nudgePollerSpawnDetached {
+		pid, err := nudge.SpawnPollerProcess(sessionName)
+		if err != nil {
+			return err
+		}
+		fmt.Println(pid)
+		return nil
+	}
 
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {

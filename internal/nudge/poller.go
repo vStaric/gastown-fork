@@ -68,13 +68,22 @@ func StartPoller(townRoot, session string) (int, error) {
 		return 0, fmt.Errorf("finding gt binary: %w", err)
 	}
 
-	cmd := buildPollerCommand(gtBin, townRoot, session)
-
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("starting nudge-poller: %w", err)
+	// DOUBLE-FORK so the poller is adopted by init regardless of who spawned it.
+	//
+	// Previously the poller was a direct child and only reached ppid=1 because the
+	// spawner happened to exit — true for short-lived commands like `gt crew start`,
+	// FALSE for the long-lived daemon. A daemon-spawned poller stayed a daemon child,
+	// and when it died nothing reaped it: it sat defunct for 25+ hours while 41
+	// queued nudges piled up (hq-8xac / hq-7onb).
+	//
+	// Setsid alone does NOT fix this — measured: a Setsid child of a live,
+	// non-reaping parent still shows STAT=Z with ppid=<spawner>. The parent has to
+	// stop being the spawner, which is what the intermediate accomplishes: it starts
+	// the poller and exits at once, so init inherits and reaps it.
+	pid, err := spawnDetachedPoller(gtBin, townRoot, session)
+	if err != nil {
+		return 0, err
 	}
-
-	pid := cmd.Process.Pid
 
 	// Write PID file for later cleanup.
 	pidPath := pollerPidFile(townRoot, session)
@@ -83,9 +92,56 @@ func StartPoller(townRoot, session string) (int, error) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write poller PID file: %v\n", err)
 	}
 
-	// Release the process so it runs independently.
-	_ = cmd.Process.Release()
+	return pid, nil
+}
 
+// SpawnPollerProcess starts the real poller process and returns its pid without
+// waiting for it. Called ONLY by the `--spawn-detached` intermediate stage, which
+// exits straight after so the poller reparents to init (hq-7onb).
+func SpawnPollerProcess(session string) (int, error) {
+	gtBin, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("finding gt binary: %w", err)
+	}
+	townRoot, err := os.Getwd()
+	if err != nil {
+		return 0, fmt.Errorf("resolving town root: %w", err)
+	}
+	cmd := buildPollerCommand(gtBin, townRoot, session)
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("starting nudge-poller: %w", err)
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Process.Release()
+	return pid, nil
+}
+
+// spawnDetachedPoller starts the nudge-poller through a short-lived intermediate
+// so the poller reparents to init. Returns the POLLER's pid, not the
+// intermediate's — the intermediate is gone by the time this returns.
+func spawnDetachedPoller(gtBin, townRoot, session string) (int, error) {
+	inner := buildPollerCommand(gtBin, townRoot, session)
+
+	// The intermediate prints the poller's pid and exits immediately, so Wait()
+	// here is cheap and cannot hang on the long-running poller itself.
+	outer := exec.Command(gtBin, "nudge-poller", session, "--spawn-detached")
+	outer.Dir = townRoot
+	util.SetDetachedProcessGroup(outer)
+	out, err := outer.Output()
+	if err == nil {
+		if pid, convErr := strconv.Atoi(strings.TrimSpace(string(out))); convErr == nil && pid > 0 {
+			return pid, nil
+		}
+	}
+
+	// Fall back to a direct spawn if the intermediate is unavailable (older binary
+	// on PATH, unexpected output). Behaviour then matches the previous code —
+	// correct, just without the reparenting guarantee.
+	if startErr := inner.Start(); startErr != nil {
+		return 0, fmt.Errorf("starting nudge-poller: %w", startErr)
+	}
+	pid := inner.Process.Pid
+	_ = inner.Process.Release()
 	return pid, nil
 }
 
