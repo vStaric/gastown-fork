@@ -212,8 +212,19 @@ func printVitalsBackups(townRoot string) {
 		fmt.Printf("  Local:  %s\n", style.Dim.Render("not found"))
 	}
 
-	// JSONL git archive
+	// JSONL git archive.
+	//
+	// The daemon's jsonl_git_backup patrol defaults to ~/.dolt-archive/git
+	// (internal/daemon/types.go), but this read looked only under the TOWN ROOT —
+	// so once backups do run, vitals reported "not available" for an archive that
+	// exists. Check the town-local path first (an explicitly configured
+	// git_repo may point there) and fall back to the daemon's default (hq-vrli).
 	archiveDir := filepath.Join(townRoot, ".dolt-archive", "git")
+	if _, statErr := os.Stat(filepath.Join(archiveDir, ".git")); os.IsNotExist(statErr) {
+		if homeDir, homeErr := os.UserHomeDir(); homeErr == nil {
+			archiveDir = filepath.Join(homeDir, ".dolt-archive", "git")
+		}
+	}
 	out, err := exec.Command("git", "-C", archiveDir, "log", "-1", "--format=%ci").Output()
 	if err != nil {
 		fmt.Printf("  JSONL:  %s\n", style.Dim.Render("not available"))

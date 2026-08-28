@@ -102,10 +102,30 @@ func (d *Daemon) syncJsonlGitBackup() {
 		gitRepo = filepath.Join(homeDir, ".dolt-archive", "git")
 	}
 
-	// Verify git repo exists.
+	// Verify the git repo exists, and CREATE it if it does not.
+	//
+	// This used to log "does not exist, skipping" and return — forever. Nothing in
+	// gt ever created the repo, so on a host where ~/.dolt-archive was absent the
+	// patrol skipped 286 consecutive times while presenting as an active safeguard.
+	// Worse, env.go disables bd's own backups citing this patrol (with dolt_backup)
+	// as the centralized replacement, so a destination that never existed was load
+	// -bearing in that justification (hq-vrli).
+	//
+	// Creating an empty git repo is cheap, idempotent and side-effect-free — it is
+	// strictly better than skipping in perpetuity. If creation fails we skip as
+	// before, with the reason.
 	if _, err := os.Stat(filepath.Join(gitRepo, ".git")); os.IsNotExist(err) {
-		d.logger.Printf("jsonl_git_backup: git repo %s does not exist, skipping", gitRepo)
-		return
+		if mkErr := os.MkdirAll(gitRepo, 0o755); mkErr != nil {
+			d.logger.Printf("jsonl_git_backup: git repo %s does not exist and cannot be created: %v, skipping", gitRepo, mkErr)
+			return
+		}
+		initCmd := exec.Command("git", "init", "--quiet")
+		initCmd.Dir = gitRepo
+		if initErr := initCmd.Run(); initErr != nil {
+			d.logger.Printf("jsonl_git_backup: git init failed in %s: %v, skipping", gitRepo, initErr)
+			return
+		}
+		d.logger.Printf("jsonl_git_backup: created archive repo %s", gitRepo)
 	}
 
 	// Determine whether to scrub (default true).
