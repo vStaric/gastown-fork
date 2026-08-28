@@ -189,11 +189,24 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		if townRoot == "" {
 			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
 		}
-		return nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 			Sender:   sender,
 			Message:  message,
 			Priority: nudgePriorityFlag,
-		})
+		}); err != nil {
+			return err
+		}
+		// Make sure something will actually DRAIN this. Enqueue succeeding is why
+		// "✓ Nudged (queue)" was truthful while 41 nudges rotted on disk behind a
+		// dead poller: nothing on the queue path ever started one, so a poller that
+		// died was only revived by a session start (hq-8xac). StartPoller is
+		// idempotent and no-ops when a live poller exists. The wait-idle path has
+		// done this for a while; the queue path — the one that depends on a poller
+		// absolutely — did not.
+		if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
+			fmt.Fprintf(os.Stderr, "queue: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
+		}
+		return nil
 
 	case NudgeModeWaitIdle:
 		if townRoot == "" {
