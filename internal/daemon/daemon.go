@@ -23,6 +23,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
@@ -1620,10 +1621,25 @@ func (d *Daemon) checkDeaconHeartbeat() {
 			}
 			d.logger.Printf("STALLED DEACON: heartbeat fresh (cycle %d) but %s with an idle pane - waking",
 				hb.Cycle, signal)
-			// Fresh-text wake ONLY, ONE dose. NudgeSession types a new message and
-			// submits that. Do NOT reach for C-j here: on this signature it CLEARS
-			// the staged continuation without submitting, discarding queued work,
-			// and Escape+Enter is inert (both measured on hq-fdiz).
+			// NON-SUBMITTING wake when the composer already holds text.
+			//
+			// NudgeSession types a message and SUBMITS it. On a pane whose composer
+			// is already loaded that appends to the staged text and submits the
+			// combination — so an automated wake would execute whatever a human or
+			// another agent had parked there. An irreversible remote-branch-delete
+			// instruction has twice re-staged itself in a yis composer with no
+			// author, and the mayor's standing ruling is that NOBODY clears or
+			// advances a loaded composer by keystroke (hq-54r9 / hq-t87m / wqy-04i).
+			//
+			// Un-sticking a pane does not require submitting what is sitting in it.
+			// So: only submit when the composer is EMPTY (our text is then the only
+			// text). When it is loaded, escalate and leave it alone — a held
+			// composer executes nothing, which is the safe failure mode.
+			if staged {
+				d.logger.Printf("STALL WAKE WITHHELD: %s composer holds text this daemon did not author — not submitting (hq-54r9). Escalating instead.", sessionName)
+				d.notifyMayorOfWithheldWake(sessionName, hb.Cycle)
+				return
+			}
 			if err := d.tmux.NudgeSession(sessionName,
 				"STALL_RECOVERY: your patrol loop has not advanced. Continue patrolling."); err != nil {
 				d.logger.Printf("Error waking stalled Deacon: %v", err)
@@ -1681,6 +1697,21 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		// for the same reason (it interrupted the deacon's await-signal backoff).
 		if !d.hasActiveWork() {
 			d.logger.Println("Deacon nudge skipped: no active work in flight, await-signal will fire naturally")
+			return
+		}
+
+		// Same guard as the stall path above. NudgeSession types text AND SUBMITS,
+		// so on a pane whose composer already holds text this appends to it and
+		// submits the combination — executing whatever a human or another agent
+		// parked there. hasActiveWork() above says nothing about composer contents,
+		// so it is not a substitute (hq-54r9).
+		//
+		// The payload here is not benign: the deacon's composer has held "install gt"
+		// and "re-stamp GT_PANE_ID". Submitting the former would replace the
+		// TOWN-WIDE binary and land ~23 uninstalled commits nobody approved.
+		if d.composerStaged(sessionName) {
+			d.logger.Printf("HEALTH_CHECK WITHHELD: %s composer holds text this daemon did not author — not submitting (hq-54r9). Escalating instead.", sessionName)
+			d.notifyMayorOfWithheldWake(sessionName, hb.Cycle)
 			return
 		}
 
@@ -3254,4 +3285,20 @@ func (d *Daemon) composerStaged(sessionName string) bool {
 		return false
 	}
 	return strings.TrimSpace(line) != ""
+}
+
+// notifyMayorOfWithheldWake reports a stall that could not be safely auto-recovered
+// because the pane's composer held text this daemon did not author.
+//
+// Withholding is the correct action (hq-54r9): submitting would execute parked text,
+// and per the mayor's ruling nobody advances or clears a loaded composer by
+// keystroke. But withholding silently would recreate the invisibility this whole
+// detector exists to fix, so the stall is escalated instead of dropped.
+func (d *Daemon) notifyMayorOfWithheldWake(sessionName string, cycle int64) {
+	_, _ = channelevents.EmitToTown(d.config.TownRoot, "mayor", "STALL_WAKE_WITHHELD", []string{
+		"source=daemon",
+		"session=" + sessionName,
+		"cycle=" + strconv.FormatInt(cycle, 10),
+		"reason=composer holds text the daemon did not author; needs the owning agent to clear or submit it",
+	})
 }
