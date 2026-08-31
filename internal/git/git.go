@@ -1147,6 +1147,18 @@ func (g *Git) StagedDeletions() ([]string, error) {
 	return strings.Split(trimmed, "\n"), nil
 }
 
+// HasStagedChanges reports whether the index holds anything that would produce a
+// commit. Callers that stage broadly (git add -A) and then selectively unstage can
+// end up with an empty index; committing that fails with exit status 1, which is
+// indistinguishable from a real commit failure. Check this first (hq-e1nr).
+func (g *Git) HasStagedChanges() (bool, error) {
+	out, err := g.run("diff", "--cached", "--name-only")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
 // Returns empty string and no error if the file does not exist at that ref.
 func (g *Git) ShowFile(ref, path string) (string, error) {

@@ -681,15 +681,49 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// This prevents the bug where a polecat's working tree has a missing
 				// tracked file (e.g. .beads/metadata.json) and the auto-save commits
 				// the deletion, breaking infrastructure for subsequent sessions.
+				withheldDeletions := 0
 				if stagedDeletions, delErr := g.StagedDeletions(); delErr == nil && len(stagedDeletions) > 0 {
 					_ = g.ResetFiles(stagedDeletions...)
+					withheldDeletions = len(stagedDeletions)
 				}
 				// Build a descriptive commit message
 				autoMsg := "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
 				if issueFromBranch := parseBranchName(branch).Issue; issueFromBranch != "" {
 					autoMsg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", issueFromBranch)
 				}
-				if commitErr := g.Commit(autoMsg); commitErr != nil {
+				// Everything staged by `git add -A` may have been unstaged again by the
+				// resets above (overlay CLAUDE.md, runtime artifacts, tracked deletions).
+				// A polecat worktree whose only uncommitted files are Gas Town scaffolding
+				// — .beads/, .claude/, .runtime/, CLAUDE.md, present in EVERY polecat
+				// worktree — leaves an empty index, and `git commit` then exits 1. That is
+				// not a failure: there was nothing to save. Reporting it as "uncommitted
+				// work may be at risk" cries wolf on the one signal that should mean real
+				// work is in danger (hq-e1nr).
+				hasStaged, stagedErr := g.HasStagedChanges()
+				if stagedErr != nil {
+					// Cannot tell — fall through and let Commit decide rather than
+					// silently skipping a save that might have been needed.
+					hasStaged = true
+				}
+				if !hasStaged {
+					// Deliberately do NOT set doneCleanupStatus = "clean" here. That value
+					// bypasses the aheadCount==0 guard below, whose own comment warns that
+					// agents self-bypass it. An empty index proves only that nothing
+					// COMMITTABLE remained — it says nothing about whether real work
+					// exists, so it must not buy an exemption from the no-commits check.
+					//
+					// Two different situations reach an empty index, and conflating them
+					// would trade a true-but-noisy warning for a false reassurance:
+					// scaffolding-only (nothing was ever at risk) and deletions-only
+					// (deliberately withheld just above, per gt-pvx). Name the second
+					// explicitly — no version of this code commits deletions, so the
+					// operator must hear that a deletion is being left behind.
+					if withheldDeletions > 0 {
+						style.PrintWarning("auto-commit: nothing committable staged — %d tracked deletion(s) withheld by design (gt-pvx); re-run with an explicit commit if the removal was intended", withheldDeletions)
+					} else {
+						fmt.Printf("%s Nothing to auto-save (only Gas Town scaffolding was uncommitted)\n", style.Dim.Render("○"))
+					}
+				} else if commitErr := g.Commit(autoMsg); commitErr != nil {
 					style.PrintWarning("auto-commit: git commit failed: %v — uncommitted work may be at risk", commitErr)
 				} else {
 					fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
