@@ -585,6 +585,13 @@ func SyncDatabasesSQL(townRoot string, opts SyncOptions) []SyncResult {
 // Returns the number of beads purged and any error encountered.
 // Errors are non-fatal — the caller should log them but continue with sync.
 // Must be called while the Dolt server is still running (bd purge needs SQL access).
+// purgeTimeout bounds a single `bd purge` invocation. It is a circuit breaker
+// against a hung bd, NOT a performance budget — it must stay well clear of the
+// real runtime, which scales with the closed-wisp backlog (measured: ~20s for a
+// 3416-row dry run, growing ~850 rows/day). The previous 60s competed with normal
+// completion and cancelled the write transaction mid-flight (hq-3rq8).
+const purgeTimeout = 10 * time.Minute
+
 func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// Resolve the beads directory for this rig (read-only — never create dirs during purge)
 	beadsDir := FindRigBeadsDir(townRoot, dbName)
@@ -613,8 +620,19 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	}
 
 	// Build bd purge command with safety-net timeout.
-	// bd purge v2 uses batched SQL (completes in seconds), but we keep a
-	// generous timeout as a circuit breaker against future regressions.
+	//
+	// The "completes in seconds" assumption below does not hold at scale. Measured
+	// on hq_queue_town with 3416 closed wisps: `bd purge --json --dry-run` alone
+	// takes ~20s, and a real write is slower — so a 60s ceiling is close enough to
+	// the actual runtime to cancel the transaction mid-flight. That surfaces as
+	// "begin write tx: context canceled", and on retry as exit 0 with nothing
+	// deleted, which reads to an operator as success (hq-3rq8).
+	//
+	// The backlog grows ~850 wisps/day, so the margin shrinks over time: a limit
+	// that works today fails silently next week. purgeTimeout scales with nothing,
+	// so it is set generously rather than tightly — the circuit-breaker intent is
+	// preserved (it still bounds a hung bd), but it no longer competes with normal
+	// completion on a real backlog.
 	env := beads.BuildMutationPinnedBDEnv(os.Environ(), beadsDir)
 	// Probe --allow-stale support with the same hardened target env used by purge.
 	args := beads.MaybePrependAllowStaleWithEnv(env, []string{"purge", "--json"})
@@ -622,7 +640,7 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 		args = append(args, "--dry-run")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), purgeTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", args...)
@@ -636,7 +654,7 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return 0, fmt.Errorf("bd purge for %s: timed out after 60s", dbName)
+		return 0, fmt.Errorf("bd purge for %s: timed out after %s (backlog too large for one pass — see hq-3rq8)", dbName, purgeTimeout)
 	}
 	if err != nil {
 		errMsg := strings.TrimSpace(stderr.String())
