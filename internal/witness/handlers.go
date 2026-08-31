@@ -2094,6 +2094,25 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		}
 	}
 
+	// A polecat whose worktree was NEVER PROVISIONED is not a zombie: it never
+	// ran, holds no work, and has nothing to recover. This is distinct from a
+	// polecat whose worktree was deleted after running — that one has state
+	// worth escalating.
+	//
+	// It matters because such a polecat is stuck in agent_state=spawning
+	// permanently (nothing advanced it), so it outlives SpawnGracePeriod and
+	// falls through above. AgentStateSpawning satisfies IsActive(), so it is
+	// then reported as an "active-work" zombie even with an EMPTY hook — and the
+	// auto-restart cannot possibly succeed, because the work directory it needs
+	// is the very thing that was never created. The patrol re-files an identical
+	// bead every cycle (hq-l94o: 18 duplicates for watch_queue_kbs/dag).
+	//
+	// Guarded to the empty-hook case: a spawning polecat WITH a hook bead did
+	// get far enough to be assigned work, so it stays a zombie candidate.
+	if snapHook == "" && polecatWorktreeMissing(workDir, rigName, polecatName) {
+		return ZombieResult{}, false
+	}
+
 	// TOCTOU guard: verify session wasn't recreated since detection.
 	if sessionRecreated(t, sessionName, detectedAt) {
 		return ZombieResult{}, false
@@ -3603,4 +3622,23 @@ func isBdNotFoundError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "no such")
+}
+
+// polecatWorktreeMissing reports whether a polecat's git worktree does not exist,
+// i.e. the polecat was never provisioned (or its worktree is gone). The path is
+// <rig>/polecats/<name>/<rigName>, matching what session creation requires — see
+// polecat.SessionManager worktree layout.
+//
+// Returns false when the town root cannot be resolved: an unknown path must not
+// be reported as a missing worktree, since that would suppress genuine zombies.
+func polecatWorktreeMissing(workDir, rigName, polecatName string) bool {
+	townRoot := workDirToTownRoot(workDir)
+	if townRoot == "" || rigName == "" || polecatName == "" {
+		return false
+	}
+	worktree := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+	if _, err := os.Stat(worktree); err != nil {
+		return os.IsNotExist(err)
+	}
+	return false
 }
