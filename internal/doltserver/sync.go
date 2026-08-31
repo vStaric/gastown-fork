@@ -668,17 +668,25 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 	// bd may emit non-JSON warning lines before the JSON object,
 	// so extract the first JSON object from stdout.
 	jsonBytes := extractJSON(stdout.Bytes())
+	// bd emits "purge_count"; older/other builds emit "purged_count". Accept both.
+	// Reading only one spelling makes a successful purge indistinguishable from a
+	// no-op: the field parses as nil, we warn to stderr and return 0, and the caller
+	// reports "nothing to purge" while rows were in fact deleted (hq-3rq8).
 	var result struct {
 		PurgedCount *int `json:"purged_count"`
+		PurgeCount  *int `json:"purge_count"`
 	}
 	if err := json.Unmarshal(jsonBytes, &result); err != nil {
 		return 0, fmt.Errorf("bd purge for %s: unexpected output format: %s", dbName, strings.TrimSpace(stdout.String()))
 	}
 
-	// Warn if purged_count field was missing from the JSON response — may indicate
-	// a schema mismatch (e.g., field renamed). An explicit 0 is a valid success case.
 	if result.PurgedCount == nil {
-		fmt.Fprintf(os.Stderr, "Warning: bd purge for %s: purged_count field missing (raw: %s)\n", dbName, strings.TrimSpace(stdout.String()))
+		result.PurgedCount = result.PurgeCount
+	}
+	// Neither spelling present: a real schema mismatch. An explicit 0 is a valid
+	// success case, so only a missing field warns.
+	if result.PurgedCount == nil {
+		fmt.Fprintf(os.Stderr, "Warning: bd purge for %s: neither purge_count nor purged_count present (raw: %s)\n", dbName, strings.TrimSpace(stdout.String()))
 		return 0, nil
 	}
 
