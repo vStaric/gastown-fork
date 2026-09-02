@@ -92,6 +92,14 @@ func StartPoller(townRoot, session string) (int, error) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write poller PID file: %v\n", err)
 	}
 
+	// Record the spawn. Nothing logged poller starts, which made a live poller's
+	// origin unknowable after the fact: on hq-8xac the deacon's working poller
+	// (pid 94170) could not be attributed to any spawner, because its parent had
+	// already exited and no log line named it. Two agents independently
+	// mis-attributed it — first to the daemon, then to launchd — from ppid=1
+	// alone. One line answers that in seconds.
+	fmt.Fprintf(os.Stderr, "nudge-poller: started pid %d for %s\n", pid, session)
+
 	return pid, nil
 }
 
