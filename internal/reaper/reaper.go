@@ -375,8 +375,21 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 			INNER JOIN issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
+		)
+		AND i.id NOT IN (
+			SELECT DISTINCT c.issue_id FROM comments c
+			WHERE c.created_at >= ?
 		)`
-	if err := db.QueryRowContext(ctx, staleQuery, now.Add(-staleIssueAge)).Scan(&result.StaleCandidates); err != nil {
+	// Mirrors AutoClose's comment-activity exclusion (hq-1g0e). If this count
+	// omitted it, the scan would report candidates that AutoClose then declines
+	// to close — a reported number nobody can reconcile against the action.
+	//
+	// NOTE: this count still omits AutoClose's gt:keep/gt:role/gt:rig/gt:agent
+	// label exclusion, so it can overstate for a different, pre-existing reason.
+	// Left alone deliberately — that divergence predates this change and is not
+	// what hq-1g0e is about.
+	staleCommentCutoff := now.Add(-staleIssueAge)
+	if err := db.QueryRowContext(ctx, staleQuery, staleCommentCutoff, staleCommentCutoff).Scan(&result.StaleCandidates); err != nil {
 		if !isTableNotFound(err) {
 			return nil, fmt.Errorf("count stale candidates: %w", err)
 		}
@@ -758,12 +771,25 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
-		)`, dbName, dbName, dbName, dbName, dbName)
+		)
+		AND i.id NOT IN (
+			SELECT DISTINCT c.issue_id FROM `+"`%s`"+`.comments c
+			WHERE c.created_at >= ?
+		)`, dbName, dbName, dbName, dbName, dbName, dbName)
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
 	// which is not valid MySQL (Error 1093) and fragile in Dolt (dolthub/dolt#10600).
+	// A comment is activity. `bd comment` does NOT bump issues.updated_at (only
+	// comment_count moves — hq-1g0e, upstream in bd 1.1.0 with no source
+	// available), so a bead being actively worked through comments looks
+	// untouched: hq-14v7 carries 15 comments and hq-4y9v 11 (one today) while
+	// both read ~6 days stale and qualify for auto-close here.
+	//
+	// Closing a bead that someone commented on this week is not reclaiming
+	// abandoned work, it is discarding live work — so recent comment activity
+	// protects a bead using the SAME cutoff as updated_at.
 	selectQuery := fmt.Sprintf("SELECT i.id, i.title, i.updated_at FROM issues i WHERE %s", whereClause)
-	rows, err := db.QueryContext(ctx, selectQuery, staleCutoff)
+	rows, err := db.QueryContext(ctx, selectQuery, staleCutoff, staleCutoff)
 	if err != nil {
 		if isTableNotFound(err) {
 			return result, nil // issues/dependencies not on this server
