@@ -364,6 +364,13 @@ type RefineryStatusOutput struct {
 	RigName     string `json:"rig_name"`
 	Session     string `json:"session,omitempty"`
 	QueueLength int    `json:"queue_length"`
+	// Patrol state. "running" is process liveness and QueueLength is the MERGE
+	// queue; neither says anything about whether the agent has ever patrolled.
+	// An agent that was never armed reported identically to a healthy one for
+	// ~6 days (hq-m3yx).
+	PatrolCount int    `json:"patrol_count"`
+	LastPatrol  string `json:"last_patrol,omitempty"`
+	PatrolState string `json:"patrol_state"`
 }
 
 func runRefineryStatus(cmd *cobra.Command, args []string) error {
@@ -387,10 +394,14 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 
 	// JSON output
 	if refineryStatusJSON {
+		patrol := agentPatrolState(rigName + "/refinery")
 		output := RefineryStatusOutput{
 			Running:     running,
 			RigName:     rigName,
 			QueueLength: queueLen,
+			PatrolCount: patrol.Count,
+			LastPatrol:  patrol.Last,
+			PatrolState: patrol.State,
 		}
 		if sessionInfo != nil {
 			output.Session = sessionInfo.Name
@@ -413,6 +424,19 @@ func runRefineryStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n  Queue: %d pending\n", queueLen)
+
+	// Patrol state is a SEPARATE axis from "running". Print it always, including
+	// the never-armed case, so patrol darkness is visible without a manual wisp
+	// query (hq-m3yx).
+	patrol := agentPatrolState(rigName + "/refinery")
+	switch patrol.State {
+	case patrolStateNeverArmed:
+		fmt.Printf("  Patrol: %s\n", style.Warning.Render("⚠ NEVER ARMED (0 patrol wisps)"))
+	case patrolStateUnknown:
+		fmt.Printf("  Patrol: %s\n", style.Dim.Render("? unknown (wisp query failed)"))
+	default:
+		fmt.Printf("  Patrol: %d wisp(s), last %s\n", patrol.Count, patrol.Last)
+	}
 
 	return nil
 }

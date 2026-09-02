@@ -226,6 +226,11 @@ type WitnessStatusOutput struct {
 	RigName           string   `json:"rig_name"`
 	Session           string   `json:"session,omitempty"`
 	MonitoredPolecats []string `json:"monitored_polecats,omitempty"`
+	// Patrol state — a separate axis from Running. See hq-m3yx: witnesses ran
+	// dark (api ~5d, kbs ~21h, yis ~34h) while reporting "running".
+	PatrolCount int    `json:"patrol_count"`
+	LastPatrol  string `json:"last_patrol,omitempty"`
+	PatrolState string `json:"patrol_state"`
 }
 
 func runWitnessStatus(cmd *cobra.Command, args []string) error {
@@ -248,10 +253,14 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 
 	// JSON output
 	if witnessStatusJSON {
+		patrol := agentPatrolState(rigName + "/witness")
 		output := WitnessStatusOutput{
 			Running:           running,
 			RigName:           rigName,
 			MonitoredPolecats: polecats,
+			PatrolCount:       patrol.Count,
+			LastPatrol:        patrol.Last,
+			PatrolState:       patrol.State,
 		}
 		if sessionInfo != nil {
 			output.Session = sessionInfo.Name
@@ -271,6 +280,18 @@ func runWitnessStatus(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		fmt.Printf("  State: %s\n", style.Dim.Render("○ stopped"))
+	}
+
+	// Patrol state is a separate axis from "running": a witness can be a live
+	// process that has never patrolled (hq-m3yx).
+	patrol := agentPatrolState(rigName + "/witness")
+	switch patrol.State {
+	case patrolStateNeverArmed:
+		fmt.Printf("  Patrol: %s\n", style.Warning.Render("⚠ NEVER ARMED (0 patrol wisps)"))
+	case patrolStateUnknown:
+		fmt.Printf("  Patrol: %s\n", style.Dim.Render("? unknown (wisp query failed)"))
+	default:
+		fmt.Printf("  Patrol: %d wisp(s), last %s\n", patrol.Count, patrol.Last)
 	}
 
 	// Show monitored polecats
