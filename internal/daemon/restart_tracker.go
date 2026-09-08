@@ -156,8 +156,10 @@ func (rt *RestartTracker) CanRestart(agentID string) bool {
 		return true
 	}
 
-	// Check if in crash loop
-	if !info.CrashLoopSince.IsZero() {
+	// Check if in crash loop. Bounded by CrashLoopMaxAge for the same reason as
+	// IsInCrashLoop: an unbounded marker blocks the restart that would clear it,
+	// so the state can never resolve without a human (hq-vw9f).
+	if !info.CrashLoopSince.IsZero() && time.Since(info.CrashLoopSince) < CrashLoopMaxAge {
 		return false
 	}
 
@@ -249,6 +251,46 @@ func (rt *RestartTracker) RecordSuccess(agentID string) {
 }
 
 // IsInCrashLoop returns true if the agent is detected as crash-looping.
+// CrashLoopMaxAge bounds how long a crash-loop marker may suppress recovery.
+//
+// Both in-code clearers sit BEHIND the guard they would release:
+//
+//	RecordRestart  (stability-period reset) — reached only after a restart is
+//	               permitted, and CanRestart returns false while the marker is set
+//	RecordSuccess  (unconditional zeroing) — called from ensureDeaconRunning
+//	               DOWNSTREAM of the IsInCrashLoop early return
+//
+// So neither exit is reachable from the state that sets them.
+//
+// Observed cost: the deacon sat frozen for 16h on 2026-09-02/03 with BOTH the
+// restart ladder and the heartbeat-kill check suppressed for ~14.5h. The deacon
+// counted 1,072 suppression events over 12 days, so this fires routinely.
+//
+// The ONLY escape is external and human: `gt daemon clear-backoff` signals the
+// daemon to reload the tracker from disk (cmd/daemon.go runDaemonClearBackoff).
+// Confirmed against seven weeks of daemon.log — 6 reload-restart signals, and
+// after every one suppression stops and the ladder fires. No suppression line
+// follows any reload. So the marker has never once released itself.
+//
+// Note the CLI prints "Cleared backoff for <agent>" itself; the daemon logs
+// "Received reload-restart signal". Grepping daemon.log for the former finds
+// nothing however often the command ran — a negative from a pattern that cannot
+// match. That mis-grep briefly convinced both the deacon and me that a
+// spontaneous release path existed (hq-vw9f).
+//
+// 2h is deliberately well past any real crash loop (backoff caps far below it)
+// while far short of the 14.5h outage: if an agent is still failing, the ladder
+// re-enters crash-loop state on the next few restarts at no cost. Erring toward
+// retrying a genuinely broken agent is much cheaper than leaving a healthy one
+// frozen with recovery disabled.
+const CrashLoopMaxAge = 2 * time.Hour
+
+// IsInCrashLoop reports whether the agent is currently held in crash-loop state.
+//
+// A marker older than CrashLoopMaxAge is treated as EXPIRED rather than active,
+// so recovery resumes on its own. This is a read-only check: the stale marker is
+// not cleared here (that needs the write lock and belongs to the restart path),
+// it simply stops suppressing.
 func (rt *RestartTracker) IsInCrashLoop(agentID string) bool {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
@@ -257,7 +299,25 @@ func (rt *RestartTracker) IsInCrashLoop(agentID string) bool {
 	if !exists {
 		return false
 	}
-	return !info.CrashLoopSince.IsZero()
+	if info.CrashLoopSince.IsZero() {
+		return false
+	}
+	return time.Since(info.CrashLoopSince) < CrashLoopMaxAge
+}
+
+// CrashLoopExpired reports whether a crash-loop marker exists but has aged past
+// CrashLoopMaxAge. Callers use this to log that recovery is resuming, so a stale
+// marker leaves a trace instead of silently ceasing to apply.
+func (rt *RestartTracker) CrashLoopExpired(agentID string) (time.Duration, bool) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	info, exists := rt.state.Agents[agentID]
+	if !exists || info.CrashLoopSince.IsZero() {
+		return 0, false
+	}
+	age := time.Since(info.CrashLoopSince)
+	return age, age >= CrashLoopMaxAge
 }
 
 // GetBackoffRemaining returns how long until the agent can be restarted.

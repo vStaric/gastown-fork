@@ -1481,6 +1481,12 @@ func (d *Daemon) ensureDeaconRunning() {
 			d.logger.Printf("Deacon is in crash loop, skipping restart (use 'gt daemon clear-backoff deacon' to reset)")
 			return
 		}
+		// A marker past CrashLoopMaxAge no longer suppresses. Say so, otherwise
+		// recovery silently resumes and the 14.5h suppression window that
+		// preceded it leaves no closing entry in the log (hq-vw9f).
+		if age, expired := d.restartTracker.CrashLoopExpired(agentID); expired {
+			d.logger.Printf("Deacon crash-loop marker is %s old (> %s) — treating as stale and allowing restart", age.Round(time.Minute), CrashLoopMaxAge)
+		}
 		if !d.restartTracker.CanRestart(agentID) {
 			remaining := d.restartTracker.GetBackoffRemaining(agentID)
 			d.logger.Printf("Deacon restart in backoff, %s remaining", remaining.Round(time.Second))
@@ -1541,6 +1547,11 @@ func (d *Daemon) checkDeaconHeartbeat() {
 	if d.restartTracker != nil && d.restartTracker.IsInCrashLoop("deacon") {
 		d.logger.Printf("Deacon is in crash-loop state, skipping heartbeat kill check")
 		return
+	}
+	if d.restartTracker != nil {
+		if age, expired := d.restartTracker.CrashLoopExpired("deacon"); expired {
+			d.logger.Printf("Deacon crash-loop marker is %s old (> %s) — stale, resuming heartbeat kill checks", age.Round(time.Minute), CrashLoopMaxAge)
+		}
 	}
 
 	// Always read heartbeat first (PATCH-005)
