@@ -335,7 +335,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 			}
 			// Best-effort: in batch mode, a formula instantiation failure should not abort or rollback the
 			// spawned polecat. We still hook the raw bead so work can proceed (e.g., missing required vars).
-			fmt.Printf("  %s Could not apply formula: %v (hooking raw bead)\n", style.Dim.Render("Warning:"), err)
+			//
+			// But this must NOT be dim-styled incidental text. A bond that fails after bd has
+			// written the molecule leaves 9 wisps with assignee=NULL that no agent can pick up,
+			// and this branch is why 6 of them accumulated unnoticed in watch_queue_api: the
+			// single-sling path errors out loudly while batch mode printed a dim warning and
+			// reported success (hq-ncth). The error text now names the leaked ids, so surface
+			// it as a real warning rather than hiding it in the dim channel.
+			style.PrintWarning("could not apply formula %s to %s: %v (hooking raw bead; any wisps named above are orphaned and need purging)", params.FormulaName, params.BeadID, err)
 		} else {
 			fmt.Printf("  %s Formula %s applied\n", style.Bold.Render("✓"), params.FormulaName)
 			beadToHook = formulaResult.BeadToHook

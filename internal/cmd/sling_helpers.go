@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1098,9 +1099,48 @@ func bondFormulaDirect(bondTarget, formulaName, beadID, formulaWorkDir, townRoot
 
 	rootID := parseBondSpawnRootID(bondOut, formulaName, beadID, "")
 	if rootID == "" {
+		// `bd mol bond` SUCCEEDED — it has already written the molecule's wisps — but
+		// its output did not name a root we could resolve. Returning bare here is what
+		// leaked 6 complete 9-step molecules (54 wisps, assignee=NULL) in
+		// watch_queue_api over two days: nothing bonds them, no agent can pick them up,
+		// and they carry no hook_bead/external_ref/created_by, so afterwards they cannot
+		// even be attributed to the sling that made them (hq-ncth, formerly hq-nf3e).
+		//
+		// Name the ids bd reported so the orphans are traceable and reapable. We do NOT
+		// delete them: bd owns that write, this path cannot tell a partially-bonded
+		// molecule from a live one, and deleting a live molecule is worse than leaking
+		// one. Surfacing the ids is the part gt can do correctly.
+		if orphans := parseBondSpawnedIDs(bondOut, beadID); len(orphans) > 0 {
+			return "", fmt.Errorf("direct bond output missing spawned root id; LEAKED WISPS %s (assignee=NULL, unpickable — purge or bond manually): %s",
+				strings.Join(orphans, ","), trimJSONForError(bondOut))
+		}
 		return "", fmt.Errorf("direct bond output missing spawned root id (output: %s)", trimJSONForError(bondOut))
 	}
 	return rootID, nil
+}
+
+// parseBondSpawnedIDs returns every id `bd mol bond` reports having created, excluding
+// the target bead itself. Used to name orphans when the root id cannot be resolved —
+// without it a failed bond leaves wisps with no hook_bead, external_ref or created_by,
+// i.e. rows nothing can attribute afterwards (hq-ncth).
+func parseBondSpawnedIDs(bondOut []byte, beadID string) []string {
+	var bondResult struct {
+		IDMapping map[string]string `json:"id_mapping"`
+	}
+	if err := json.Unmarshal(bondOut, &bondResult); err != nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(bondResult.IDMapping))
+	ids := make([]string, 0, len(bondResult.IDMapping))
+	for _, mappedID := range bondResult.IDMapping {
+		if mappedID == "" || mappedID == beadID || seen[mappedID] {
+			continue
+		}
+		seen[mappedID] = true
+		ids = append(ids, mappedID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // parseBondSpawnRootID extracts the spawned molecule root from bd mol bond JSON.
