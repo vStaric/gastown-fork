@@ -434,8 +434,24 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// identity and should not be closed by the wisp reaper regardless of age.
 	// Closed-molecule steps are closed immediately through a separate path, so stale
 	// max-age counts exclude them to keep dry-run and scan counts disjoint.
+	// NEVER TTL-reap a patrol root. A hooked patrol wisp legitimately sits open
+	// for a full cycle, and the deacon's documented cadence is 58-358 min while
+	// defaultWispMaxAge is 24h — so a patrol that is merely IDLE BY DESIGN crosses
+	// the staleness cutoff and gets swept. That is why this reaper only ever ate
+	// patrols and never a working step.
+	//
+	// Measured damage before this guard: EIGHT patrol roots destroyed across five
+	// events (09-03 to 09-08), spanning all three refineries in a single second,
+	// four witnesses, and the deacon's own patrol. Lifetimes 1443-2292 min, i.e.
+	// tightly clustered just past the 24h cutoff — never below it. One
+	// (hq-wisp-aeftp, yis/witness) preceded a ~113h dark rig; another (vrkov,
+	// api/witness) caused a ~48h darkness that was initially misattributed to
+	// parked composer text. hq-boy3.
+	//
+	// The reaper's actual job — NULL-assignee dog-step churn — is untouched by
+	// this: those are not titled mol-*patrol.
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, parentWhere)
+		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND w.title NOT LIKE 'mol-%%patrol%%' AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
