@@ -562,9 +562,21 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 		}
 		inClause := strings.Join(placeholders, ",")
 
+		// Stamp WHY. Closing with no close_reason and no closed_by_session leaves no
+		// trace of who acted: eight patrol ROOT wisps were closed this way across
+		// five events (09-03 through 09-08), each having been stuck 1443-2292 min —
+		// far outside the 58-358 min cadence — and the only record that a patrol had
+		// been wedged for 24-38h was erased by the close itself. One of them
+		// (hq-wisp-aeftp, yis/witness) preceded a ~113h dark rig. Normally-closed
+		// patrol roots average 137 min, so these were long-dead before the reaper
+		// touched them; the defect is the SILENCE, not the closing. hq-boy3.
+		//
+		// description is already the caller's label ("stale wisps", "closed molecule
+		// steps"), so this needs no new plumbing and cannot disagree with the count
+		// the caller reports.
 		updateQuery := fmt.Sprintf(
-			"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s) AND status IN ('open', 'hooked', 'in_progress') AND issue_type != 'agent'",
-			inClause)
+			"UPDATE wisps SET status='closed', closed_at=NOW(), close_reason=%s WHERE id IN (%s) AND status IN ('open', 'hooked', 'in_progress') AND issue_type != 'agent'",
+			quoteSQLLiteral("reaper: "+description), inClause)
 		sqlResult, err := runner.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
 			return total, fmt.Errorf("close %s batch: %w", description, err)
@@ -1138,4 +1150,14 @@ func FormatJSON(v interface{}) string {
 		return fmt.Sprintf(`{"error": %q}`, err.Error())
 	}
 	return string(data)
+}
+
+// quoteSQLLiteral renders a Go string as a single-quoted SQL literal, escaping
+// backslashes and quotes. Used for the reaper's own close_reason values, which are
+// compile-time labels rather than user input — but escaped anyway so a future
+// caller-supplied description cannot break the statement.
+func quoteSQLLiteral(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, "'", "''")
+	return "'" + v + "'"
 }
