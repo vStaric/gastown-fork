@@ -1094,6 +1094,16 @@ func bondFormulaDirect(bondTarget, formulaName, beadID, formulaWorkDir, townRoot
 		WithAutoCommit().
 		Output()
 	if err != nil {
+		// bd exited nonzero, but it may ALREADY have written part of the molecule —
+		// the 2026-09-08 22:11-22:16 recurrence leaked four batches of 8 step wisps
+		// with NO root at all, so the write can fail partway through rather than
+		// producing a tidy whole molecule. Name whatever it reported creating, on
+		// this path too: the previous fix covered only the unparseable-output branch
+		// below, which would have missed that entire recurrence (hq-ncth).
+		if orphans := parseBondSpawnedIDs(bondOut, beadID); len(orphans) > 0 {
+			return "", fmt.Errorf("%w; PARTIAL WRITE — LEAKED WISPS %s (assignee=NULL, unpickable — purge or bond manually) (args: %s)",
+				err, strings.Join(orphans, ","), strings.Join(bondArgs, " "))
+		}
 		return "", fmt.Errorf("%w (args: %s)", err, strings.Join(bondArgs, " "))
 	}
 
