@@ -448,10 +448,26 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// api/witness) caused a ~48h darkness that was initially misattributed to
 	// parked composer text. hq-boy3.
 	//
+	// Escalation notifications are protected TOO, and by LABEL rather than title,
+	// because the title-based guard above does not cover them: an escalation wisp
+	// is titled after its subject, so "kbs witness patrol will be destroyed..."
+	// does not match mol-%patrol% and was reapable at 1430 min. An unread HIGH
+	// escalation being TTL-swept before anyone reads it is the same class of harm
+	// as sweeping the patrol it warns about.
+	//
+	// Bounded, not catastrophic: `gt escalate` creates TWO objects — a durable
+	// BEAD carrying the ownership (hq-zxww, assignee mayor/) and an unowned
+	// notification WISP (hq-wisp-05lcfv, assignee NULL). Reaping the wisp loses
+	// the notification, not the escalation. NULL assignee there is BY DESIGN:
+	// 10 of 10 escalation wisps in five months of history are NULL, so it is the
+	// carrier's normal shape and NOT an hq-ncth-style leak.
+	//
 	// The reaper's actual job — NULL-assignee dog-step churn — is untouched by
-	// this: those are not titled mol-*patrol.
+	// either guard: those are not titled mol-*patrol and carry no gt:escalation.
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND w.title NOT LIKE 'mol-%%patrol%%' AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, parentWhere)
+		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND w.title NOT LIKE 'mol-%%patrol%%'"+
+			" AND NOT EXISTS (SELECT 1 FROM wisp_labels el WHERE el.issue_id = w.id AND el.label = 'gt:escalation')"+
+			" AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
