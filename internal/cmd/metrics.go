@@ -70,11 +70,39 @@ func runMetrics(cmd *cobra.Command, args []string) error {
 }
 
 func readUsageLog() ([]usageEntry, error) {
-	f, err := os.Open(logUsagePath)
-	if err != nil {
-		if os.IsNotExist(err) {
+	// Read the rotated generation first so entries stay in chronological order.
+	// Without this, rotation (hq-m9pk) would silently halve the window `gt metrics`
+	// reports on, with no indication that older data existed — the report would
+	// look complete and be wrong.
+	var entries []usageEntry
+	rotatedEntries, rotatedErr := scanUsageFile(logUsagePath + ".1")
+	entries = append(entries, rotatedEntries...)
+
+	liveEntries, liveErr := scanUsageFile(logUsagePath)
+	entries = append(entries, liveEntries...)
+
+	if len(entries) == 0 {
+		// Only report "no data" when NEITHER file yielded anything; a missing
+		// rotated file is the normal case and must not mask live data.
+		if os.IsNotExist(liveErr) && (rotatedErr == nil || os.IsNotExist(rotatedErr)) {
 			return nil, fmt.Errorf("no usage data yet (run some gt commands first)")
 		}
+		if liveErr != nil {
+			return nil, liveErr
+		}
+		if rotatedErr != nil && !os.IsNotExist(rotatedErr) {
+			return nil, rotatedErr
+		}
+	}
+	return entries, nil
+}
+
+// scanUsageFile parses one JSONL usage log. A missing file yields no entries and
+// the os.IsNotExist error, which callers treat as "nothing to add" rather than
+// as a failure — the rotated generation is absent until the first rotation.
+func scanUsageFile(path string) ([]usageEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
