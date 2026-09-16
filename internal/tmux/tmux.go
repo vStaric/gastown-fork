@@ -2010,7 +2010,20 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		// Codex trust screens include a leading ">" banner line, so prompt
 		// detection alone would exit too early.
 		if containsWorkspaceTrustDialog(content) {
-			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
+			// Select the AFFIRMATIVE option before confirming. Enter alone is NOT
+			// safe: Claude Code pre-selects the REFUSING option ("❯ No, exit"), so
+			// a bare Enter confirms "No" and the agent exits 1 with an empty pane.
+			// WaitForRuntimeReady then times out with "timeout waiting for runtime
+			// prompt" and kills the session, and the daemon respawns into the same
+			// dialog forever (hq-i0wf — 29 consecutive failures on wqi; verified by
+			// driving a real dialog: bare Enter -> EXITCODE=1; Down+Enter -> Claude
+			// boots to its prompt).
+			//
+			// Move by label rather than assuming a fixed offset, so a reordered or
+			// single-option dialog still lands on the right entry.
+			if err := t.selectTrustAffirmative(session, content); err != nil {
+				return err
+			}
 			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
 				return err
 			}
@@ -2031,6 +2044,74 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 
 	// Timeout — no dialog detected, safe to proceed
 	return nil
+}
+
+// selectTrustAffirmative moves the dialog's selection onto the option that
+// GRANTS trust.
+//
+// The cursor glyph marks the current row. If it already sits on the affirming
+// option there is nothing to do; otherwise press Down until it does, bounded by
+// the number of rows so a dialog we do not recognise cannot spin. When no
+// affirming option can be identified we leave the selection alone and let the
+// caller's Enter fall through to whatever is selected — the pre-existing
+// behaviour — rather than pressing keys blindly.
+func (t *Tmux) selectTrustAffirmative(session, content string) error {
+	const maxMoves = 5
+	for i := 0; i <= maxMoves; i++ {
+		if trustAffirmativeSelected(content) {
+			return nil
+		}
+		if !contentHasTrustAffirmative(content) {
+			return nil // unknown layout: do not press keys blindly
+		}
+		if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
+			return err
+		}
+		time.Sleep(150 * time.Millisecond)
+		refreshed, err := t.CapturePane(session, 30)
+		if err != nil {
+			return nil // cannot verify; caller's Enter still applies
+		}
+		content = refreshed
+	}
+	return nil
+}
+
+// trustAffirmativeSelected reports whether the selection cursor is on the line
+// that grants trust.
+func trustAffirmativeSelected(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "❯") && !strings.HasPrefix(trimmed, ">") {
+			continue
+		}
+		if isTrustAffirmativeOption(trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+// contentHasTrustAffirmative reports whether an affirming option is present at all.
+func contentHasTrustAffirmative(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if isTrustAffirmativeOption(strings.TrimSpace(line)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTrustAffirmativeOption matches the option that GRANTS trust, and must never
+// match the refusing one ("No, exit").
+func isTrustAffirmativeOption(line string) bool {
+	lower := strings.ToLower(line)
+	if strings.Contains(lower, "no, exit") {
+		return false
+	}
+	return strings.Contains(lower, "yes, i trust") ||
+		strings.Contains(lower, "yes, proceed") ||
+		(strings.Contains(lower, "trust") && strings.Contains(lower, "yes"))
 }
 
 func containsWorkspaceTrustDialog(content string) bool {
