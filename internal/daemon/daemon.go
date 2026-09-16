@@ -1968,9 +1968,31 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// context (checks for active work before declaring something stuck).
 	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
 
+	// Back off a refinery whose spawn keeps failing. Without this the daemon
+	// retries at the SAME rate forever: hq-i0wf recorded 29 consecutive
+	// "timeout waiting for runtime prompt" failures ~6.5 min apart with no
+	// decay and no give-up. The tracker that already guards deacon restarts
+	// gives us exponential backoff and crash-loop detection for free; the
+	// refinery path simply never used it.
+	refineryAgentID := "refinery-" + rigName
+	if d.restartTracker != nil && !d.restartTracker.CanRestart(refineryAgentID) {
+		remaining := d.restartTracker.GetBackoffRemaining(refineryAgentID)
+		d.logger.Printf("Refinery spawn for %s in backoff, %s remaining - skipping", rigName, remaining.Round(time.Second))
+		return
+	}
+
 	if err := mgr.Start(false, ""); err != nil {
 		if errors.Is(err, refinery.ErrAlreadyRunning) {
-			// Already running - this is the expected case when fix is working
+			// Already running - this is the expected case when fix is working.
+			// RecordSuccess does NOT clear backoff immediately: it only resets
+			// once the refinery has been up for StabilityPeriod (30m). That is
+			// fine here — the backoff windows (30s..10m) are all shorter than
+			// that, so a genuinely working refinery is never held back — but it
+			// is a stability reset, not an immediate clear. See
+			// TestRefineryBackoff_RecordSuccessDoesNotClearImmediately.
+			if d.restartTracker != nil {
+				d.restartTracker.RecordSuccess(refineryAgentID)
+			}
 			d.logger.Printf("Refinery for %s already running, skipping spawn", rigName)
 			return
 		}
@@ -1982,8 +2004,24 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 			d.logger.Printf("Skipping refinery auto-start for %s: %v", rigName, err)
 			return
 		}
+		// Deliberate policy: only a REAL spawn failure counts toward backoff.
+		// The three cases above are "not supposed to run", not failures, and
+		// counting them would back off a rig that is behaving correctly.
+		if d.restartTracker != nil {
+			d.restartTracker.RecordRestart(refineryAgentID)
+			if err := d.restartTracker.Save(); err != nil {
+				d.logger.Printf("warning: saving refinery restart state for %s: %v", rigName, err)
+			}
+		}
 		d.logger.Printf("Error starting refinery for %s: %v", rigName, err)
 		return
+	}
+
+	if d.restartTracker != nil {
+		d.restartTracker.RecordSuccess(refineryAgentID)
+		if err := d.restartTracker.Save(); err != nil {
+			d.logger.Printf("warning: saving refinery restart state for %s: %v", rigName, err)
+		}
 	}
 
 	d.metrics.recordRestart(d.ctx, "refinery")
