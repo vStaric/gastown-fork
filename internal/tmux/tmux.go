@@ -3392,6 +3392,13 @@ func firstPaneTarget(session string) string {
 	return session + ":^"
 }
 
+// FirstPaneTarget is the exported form of firstPaneTarget, for callers outside
+// this package that build tmux targets themselves (e.g. internal/web). It
+// exists so the base-index rule lives in exactly one place.
+func FirstPaneTarget(session string) string {
+	return firstPaneTarget(session)
+}
+
 // DefaultReadyPromptPrefix is the Claude Code prompt prefix used for idle detection.
 // Claude Code uses ❯ (U+276F) as the prompt character.
 const DefaultReadyPromptPrefix = "❯ "

@@ -1921,9 +1921,13 @@ func (h *APIHandler) detectCrewState(ctx context.Context, sessionName, hook stri
 
 // isClaudeRunningInSession checks if Claude/agent is actively running.
 func (h *APIHandler) isClaudeRunningInSession(ctx context.Context, sessionName string) bool {
-	// Target pane 0 explicitly (:0.0) to avoid false positives from
-	// user-created split panes running shells or other commands.
-	cmd := exec.CommandContext(ctx, "tmux", "display-message", "-t", sessionName+":0.0", "-p", "#{pane_current_command}")
+	// Target the session's first window explicitly (rather than whichever
+	// window is active) to avoid false positives from user-created split panes
+	// running shells or other commands. The target must not hardcode a literal
+	// index: base-index/pane-base-index are commonly set to 1, and ":0.0" then
+	// fails with "can't find window: 0" — which this function reports as "no
+	// agent running", making every live agent read as dark (hq-aqwp).
+	cmd := exec.CommandContext(ctx, "tmux", "display-message", "-t", tmux.FirstPaneTarget(sessionName), "-p", "#{pane_current_command}")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
