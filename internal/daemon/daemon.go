@@ -3288,14 +3288,7 @@ func (d *Daemon) stalledAtTurnBoundary(sessionName string, cycle int64, stallGra
 // 4 SECONDS later, so a single probe landing in that window sees a healthy idle
 // agent during a real stall.
 func (d *Daemon) composerStaged(sessionName string) bool {
-	if !d.tmux.IsIdle(sessionName) {
-		return false // mid-turn: queued text here is normal, not a stall
-	}
-	line, err := d.tmux.ReadyPromptLine(sessionName)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(line) != ""
+	return d.tmux.ComposerStaged(sessionName)
 }
 
 // notifyMayorOfWithheldWake reports a stall that could not be safely auto-recovered

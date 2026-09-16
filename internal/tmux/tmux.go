@@ -3561,6 +3561,34 @@ func (t *Tmux) ReadyPromptLine(session string) (string, error) {
 	return "", fmt.Errorf("no prompt line found in %s", session)
 }
 
+// ComposerStaged reports whether an idle session's composer already holds text.
+//
+// This is the safety predicate for every AUTOMATED wake. NudgeSession types a
+// message and SUBMITS it, so injecting into a pane whose composer is already
+// loaded appends to that text and submits the combination — executing whatever
+// a human or another agent parked there, attributed to an agent that never
+// authored it. Six rig composers have held unauthored instructions for over a
+// day, four of them remote-branch deletions (hq-aqwp, hq-54r9, hq-t87m).
+//
+// A loaded composer is indistinguishable from a healthy idle agent by prompt
+// detection alone: WaitForIdle sees an idle prompt either way. So callers that
+// gate on idleness MUST also gate on this.
+//
+// Returns false mid-turn: text in the composer then is normal, not parked.
+// Returns false when the pane cannot be read — callers treat an unreadable
+// pane as "do not withhold" so a capture failure cannot wedge delivery
+// permanently; a failed read is not evidence of an empty composer.
+func (t *Tmux) ComposerStaged(session string) bool {
+	if !t.IsIdle(session) {
+		return false // mid-turn: queued text here is normal, not a stall
+	}
+	line, err := t.ReadyPromptLine(session)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(line) != ""
+}
+
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"

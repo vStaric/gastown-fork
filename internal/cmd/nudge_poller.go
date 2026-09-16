@@ -122,7 +122,8 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			}
 
 			// Check if there are queued nudges.
-			if n, _ := nudge.Pending(townRoot, sessionName); n == 0 {
+			pending, _ := nudge.Pending(townRoot, sessionName)
+			if pending == 0 {
 				continue
 			}
 
@@ -131,6 +132,24 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 			// best-effort behavior and drain on the poll interval.
 			waitErr := t.WaitForIdle(sessionName, idleTimeout)
 			if shouldSkipDrainUntilIdle(hasPromptDetection, waitErr) {
+				continue
+			}
+
+			// NEVER inject into a composer that already holds text.
+			//
+			// NudgeSession types AND submits, so draining into a loaded composer
+			// submits the parked text together with ours — executing an instruction
+			// this agent never authored (hq-aqwp). WaitForIdle above does NOT cover
+			// this: a loaded composer sits at an idle prompt and looks perfectly
+			// healthy. The same guard already protects the daemon's two deacon wake
+			// paths; the poller is the path that reaches rig agents.
+			//
+			// Check BEFORE draining. Draining first would consume the queued nudge
+			// and then discard it, silently losing the wake. Leaving it queued means
+			// delivery simply resumes once the composer is cleared by its owner.
+			if t.ComposerStaged(sessionName) {
+				fmt.Fprintf(os.Stderr, "nudge-poller: %s composer holds unsent text — withholding injection, leaving %d nudge(s) queued\n",
+					sessionName, pending)
 				continue
 			}
 
