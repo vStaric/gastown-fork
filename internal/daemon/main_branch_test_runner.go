@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -69,6 +70,16 @@ func mainBranchTestRigs(config *DaemonPatrolConfig) []string {
 	}
 	return nil
 }
+
+// errNoTestCommands reports that a rig has no test/gate commands configured, so
+// nothing was run.
+//
+// This MUST be distinguishable from a pass. It previously returned nil, which
+// the caller counted as "passed", so the patrol logged "9 tested, 0 failed"
+// while executing nothing at all — a monitor that cannot go red, and one whose
+// green is byte-identical to a real green (hq-orc1: 252 such skips over two
+// days). A skip is not a result.
+var errNoTestCommands = errors.New("no test commands configured")
 
 // rigGateConfig holds the gate/test configuration extracted from a rig's config.json.
 type rigGateConfig struct {
@@ -152,23 +163,44 @@ func (d *Daemon) runMainBranchTests() {
 	allowedRigs := mainBranchTestRigs(d.patrolConfig)
 	timeout := mainBranchTestTimeout(d.patrolConfig)
 
-	var tested, failed int
-	var failures []string
-
+	var selected []string
 	for _, rigName := range rigNames {
 		if len(allowedRigs) > 0 && !sliceContains(allowedRigs, rigName) {
 			continue
 		}
+		selected = append(selected, rigName)
+	}
 
+	d.runMainBranchTestsForRigs(selected, timeout)
+}
+
+// runMainBranchTestsForRigs runs the gates for each already-filtered rig and
+// reports the cycle. Split out from runMainBranchTests so the reporting — the
+// part that was wrong in hq-orc1 — can be asserted directly.
+func (d *Daemon) runMainBranchTestsForRigs(rigNames []string, timeout time.Duration) {
+	var tested, failed, skipped int
+	var failures []string
+	var skippedRigs []string
+
+	for _, rigName := range rigNames {
 		rigPath := filepath.Join(d.config.TownRoot, rigName)
-		if err := d.testRigMainBranch(rigName, rigPath, timeout); err != nil {
+		err := d.testRigMainBranch(rigName, rigPath, timeout)
+		switch {
+		case errors.Is(err, errNoTestCommands):
+			// Ran nothing: neither a pass nor a failure. Counting this as
+			// "tested" is what made the patrol vacuous (hq-orc1).
+			d.logger.Printf("main_branch_test: %s: SKIPPED (no test commands configured)", rigName)
+			skippedRigs = append(skippedRigs, rigName)
+			skipped++
+		case err != nil:
 			d.logger.Printf("main_branch_test: %s: FAILED: %v", rigName, err)
 			failures = append(failures, fmt.Sprintf("%s: %v", rigName, err))
 			failed++
-		} else {
+			tested++
+		default:
 			d.logger.Printf("main_branch_test: %s: passed", rigName)
+			tested++
 		}
-		tested++
 	}
 
 	if len(failures) > 0 {
@@ -177,7 +209,15 @@ func (d *Daemon) runMainBranchTests() {
 		d.escalate("main_branch_test", msg)
 	}
 
-	d.logger.Printf("main_branch_test: patrol cycle complete (%d tested, %d failed)", tested, failed)
+	d.logger.Printf("main_branch_test: patrol cycle complete (%d tested, %d failed, %d skipped)", tested, failed, skipped)
+
+	// A cycle that tested NOTHING is not a green. Say so explicitly, so nobody
+	// reads the summary as coverage: the whole point of hq-orc1 is that silence
+	// here looked identical to success.
+	if tested == 0 && skipped > 0 {
+		d.logger.Printf("main_branch_test: WARNING: no rig ran any test this cycle — %d rig(s) have no test commands configured (%s). This patrol is currently providing NO main-branch coverage.",
+			skipped, strings.Join(skippedRigs, ", "))
+	}
 }
 
 // testRigMainBranch tests a single rig's main branch.
@@ -188,8 +228,7 @@ func (d *Daemon) testRigMainBranch(rigName, rigPath string, timeout time.Duratio
 		return fmt.Errorf("loading gate config: %w", err)
 	}
 	if gateCfg == nil {
-		d.logger.Printf("main_branch_test: %s: no test commands configured, skipping", rigName)
-		return nil
+		return errNoTestCommands
 	}
 
 	// Determine default branch
