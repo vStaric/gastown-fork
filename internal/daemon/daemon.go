@@ -1772,6 +1772,26 @@ func (d *Daemon) restartStuckDeacon(sessionName, reason string) {
 		}
 	}
 
+	// Distinguish "blocked inside a gt call" from "dead", for the same reason as
+	// the usage-limit check above: both look identical from the heartbeat alone,
+	// and killing is the wrong response to one of them.
+	//
+	// A gt call that cannot return starves the heartbeat — gt deacon heartbeat
+	// and gt hook are the patrol's first two steps — so the detector reads a
+	// LIVE, reasoning agent as dead and kills it. The respawned deacon runs gt
+	// hook as its first act and blocks again, so the detector CAUSES the
+	// staleness it is reacting to. That loop killed a live deacon 18 times in
+	// one daemon.log (hq-z9ze).
+	//
+	// Withholding is safe: a blocked call either drains (the agent resumes on
+	// its own, as it did after the reported 78-minute stall) or the gt process
+	// dies, at which point no gt is running and the next tick restarts normally.
+	if age, blocked := blockedInGtCall(); blocked {
+		d.logger.Printf("Stuck-agent-dog: NOT killing Deacon — a gt call has been running %s, so the heartbeat is STARVED, not dead (hq-z9ze). Reason was: %s",
+			age.Round(time.Second), reason)
+		return
+	}
+
 	// Kill the stuck session
 	d.logger.Printf("Stuck-agent-dog: killing stuck Deacon session %s (reason: %s)", sessionName, reason)
 	if err := d.tmux.KillSession(sessionName); err != nil {
