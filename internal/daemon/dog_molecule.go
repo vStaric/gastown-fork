@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+
+	"github.com/steveyegge/gastown/internal/formula"
 )
 
 const (
@@ -50,6 +52,7 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 type dogMol struct {
 	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
 	stepIDs  map[string]string // step slug -> wisp issue ID
+	formula  string            // Formula name, used to map step titles back to their declared IDs.
 	bdPath   string
 	townRoot string
 	logger   interface{ Printf(string, ...interface{}) }
@@ -61,6 +64,7 @@ type dogMol struct {
 func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *dogMol {
 	dm := &dogMol{
 		stepIDs:  make(map[string]string),
+		formula:  formulaName,
 		bdPath:   d.bdPath,
 		townRoot: d.config.TownRoot,
 		logger:   d.logger,
@@ -88,6 +92,14 @@ func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *do
 
 	// Discover step IDs by listing children of the root wisp.
 	dm.discoverSteps()
+
+	// A step that is declared but not discovered can never be closed or failed —
+	// it surfaces later as an unrelated-looking `failStep "x": unknown step`.
+	// Report the mismatch HERE, where the cause is visible (hq-g3z5).
+	if declared := declaredStepCount(formulaName); declared > 0 && declared != len(dm.stepIDs) {
+		d.logger.Printf("dog_molecule: WARNING %s declares %d steps but only %d were discovered (missing: %v) — those steps can never be closed",
+			formulaName, declared, len(dm.stepIDs), missingSteps(formulaName, dm.stepIDs))
+	}
 
 	d.logger.Printf("dog_molecule: poured %s → %s (%d steps)", formulaName, dm.rootID, len(dm.stepIDs))
 	return dm
@@ -205,53 +217,108 @@ func (dm *dogMol) discoverSteps() {
 		return
 	}
 
-	// Map known step slugs from each child's title. The wisp title typically starts
-	// with the step title from the formula.
+	// Map each child wisp back to its formula step ID by TITLE.
+	//
+	// This used to guess the slug from hardcoded keywords ("backup", "sync",
+	// "report", ...) matched as substrings in a first-match-wins switch. That is
+	// unsound: a title matches whichever keyword appears earliest in the switch,
+	// not the one that belongs to it. "Sync databases to backup remotes" (step
+	// "sync") contains "backup", which was tested first, so it was filed under
+	// "backup" — and "Sync backups to offsite storage" (step "offsite") collided
+	// into the same key and overwrote it. Result: 3 declared steps, 2 discovered,
+	// no "sync" key, and 139 `failStep "sync": unknown step` lines (hq-g3z5).
+	//
+	// The formula already declares the exact title for every step, so match
+	// against THAT instead of guessing. A title that does not correspond to any
+	// declared step is reported rather than silently dropped.
+	titleToID := formulaStepTitles(dm.formula)
+
 	for _, child := range children {
 		if child.ID == "" || child.Title == "" {
 			continue
 		}
+		slug, ok := titleToID[normalizeStepTitle(child.Title)]
+		if !ok {
+			dm.logger.Printf("dog_molecule: discover steps: child %s title %q matches no step declared by %s — not mapped",
+				child.ID, child.Title, dm.formula)
+			continue
+		}
+		if prev, dup := dm.stepIDs[slug]; dup {
+			dm.logger.Printf("dog_molecule: discover steps: step %q matched twice (%s and %s) in %s",
+				slug, prev, child.ID, dm.formula)
+			continue
+		}
+		dm.stepIDs[slug] = child.ID
+	}
+}
 
-		titleLower := strings.ToLower(child.Title)
-		switch {
-		case strings.Contains(titleLower, "scan"):
-			dm.stepIDs["scan"] = child.ID
-		case strings.Contains(titleLower, "reap"):
-			dm.stepIDs["reap"] = child.ID
-		case strings.Contains(titleLower, "purge"):
-			dm.stepIDs["purge"] = child.ID
-		case strings.Contains(titleLower, "report"):
-			dm.stepIDs["report"] = child.ID
-		case strings.Contains(titleLower, "export"):
-			dm.stepIDs["export"] = child.ID
-		case strings.Contains(titleLower, "push"):
-			dm.stepIDs["push"] = child.ID
-		case strings.Contains(titleLower, "diagnos"):
-			dm.stepIDs["diagnose"] = child.ID
-		case strings.Contains(titleLower, "backup"):
-			dm.stepIDs["backup"] = child.ID
-		case strings.Contains(titleLower, "probe"):
-			dm.stepIDs["probe"] = child.ID
-		case strings.Contains(titleLower, "inspect"):
-			dm.stepIDs["inspect"] = child.ID
-		case strings.Contains(titleLower, "clean"):
-			dm.stepIDs["clean"] = child.ID
-		case strings.Contains(titleLower, "verif"):
-			dm.stepIDs["verify"] = child.ID
-		case strings.Contains(titleLower, "compact"):
-			dm.stepIDs["compact"] = child.ID
-		case strings.Contains(titleLower, "checkpoint"):
-			dm.stepIDs["checkpoint"] = child.ID
-		case strings.Contains(titleLower, "auto-close") || strings.Contains(titleLower, "auto close"):
-			dm.stepIDs["auto-close"] = child.ID
-		case strings.Contains(titleLower, "sync"):
-			dm.stepIDs["sync"] = child.ID
-		case strings.Contains(titleLower, "offsite"):
-			dm.stepIDs["offsite"] = child.ID
-		case strings.Contains(titleLower, "rotat"):
-			dm.stepIDs["rotate"] = child.ID
+// formulaStepTitles maps each declared step's normalized title to its step ID.
+// Returns nil when the formula cannot be loaded, in which case discovery maps
+// nothing and the pour-time mismatch warning reports it.
+func formulaStepTitles(formulaName string) map[string]string {
+	f := loadDogFormula(formulaName)
+	if f == nil {
+		return nil
+	}
+	out := make(map[string]string, len(f.Steps))
+	for _, step := range f.Steps {
+		if step.ID == "" || step.Title == "" {
+			continue
+		}
+		out[normalizeStepTitle(step.Title)] = step.ID
+	}
+	return out
+}
+
+// declaredStepCount returns how many steps a formula declares, or 0 if unknown.
+func declaredStepCount(formulaName string) int {
+	f := loadDogFormula(formulaName)
+	if f == nil {
+		return 0
+	}
+	return len(f.Steps)
+}
+
+// missingSteps lists declared step IDs that discovery did not map.
+func missingSteps(formulaName string, found map[string]string) []string {
+	f := loadDogFormula(formulaName)
+	if f == nil {
+		return nil
+	}
+	var missing []string
+	for _, step := range f.Steps {
+		if step.ID == "" {
+			continue
+		}
+		if _, ok := found[step.ID]; !ok {
+			missing = append(missing, step.ID)
 		}
 	}
+	return missing
+}
+
+// loadDogFormula parses an embedded dog formula. Dog formulas ship with the
+// binary, so this needs no town/rig lookup.
+func loadDogFormula(formulaName string) *formula.Formula {
+	if formulaName == "" {
+		return nil
+	}
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		return nil
+	}
+	f, err := formula.Parse(content)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+// normalizeStepTitle canonicalizes a title for comparison. Wisp titles are
+// created from the formula title, but tolerate case and whitespace drift rather
+// than failing to map a step over a stray space.
+func normalizeStepTitle(title string) string {
+	return strings.Join(strings.Fields(strings.ToLower(title)), " ")
 }
 
 // childInfo holds fields from child wisp JSON used by discoverSteps and
