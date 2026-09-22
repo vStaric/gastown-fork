@@ -656,7 +656,7 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 				return fmt.Errorf("checking session: %w", err)
 			}
 			if !exists {
-				return fmt.Errorf("session %q not found", target)
+				return fmt.Errorf("session %q not found%s", target, suggestQualifiedTarget(t, target))
 			}
 		}
 
@@ -976,4 +976,41 @@ func addressToAgentBeadID(address string) string {
 		}
 		return session.PolecatSessionName(session.PrefixFor(rig), role)
 	}
+}
+
+// suggestQualifiedTarget builds a hint when a bare agent name was given where a
+// rig-qualified one is required.
+//
+// `gt nudge Karsa` failed with a bare "session not found" plus a usage dump,
+// which says nothing about the real problem: the target needed to be
+// "watch_queue_api/Karsa". The name is right, only unqualified — so point at
+// the qualified form instead of leaving the caller to guess (wqp-171e).
+//
+// Returns "" when nothing matches, so the error is unchanged in that case.
+func suggestQualifiedTarget(t *tmux.Tmux, target string) string {
+	if t == nil || target == "" || strings.Contains(target, "/") {
+		return ""
+	}
+	sessions, err := t.ListSessions()
+	if err != nil {
+		return ""
+	}
+
+	lower := strings.ToLower(target)
+	var matches []string
+	for _, sess := range sessions {
+		// Session names are "<rigprefix>-<agent>" or "<rigprefix>-crew-<agent>".
+		parts := strings.Split(sess, "-")
+		if len(parts) < 2 {
+			continue
+		}
+		if strings.ToLower(parts[len(parts)-1]) == lower {
+			matches = append(matches, sess)
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" — did you mean a rig-qualified target? %q matches session(s): %s (try \"<rig>/%s\")",
+		target, strings.Join(matches, ", "), target)
 }
