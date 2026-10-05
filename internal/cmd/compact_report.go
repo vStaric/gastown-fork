@@ -658,12 +658,7 @@ func formatWeeklyRollup(rollup *weeklyRollup) string {
 func findExistingCompactReport(dateStr string) (string, error) {
 	expectedTitle := fmt.Sprintf("Compaction Report %s", dateStr)
 
-	listCmd := exec.Command("bd", "list",
-		"--type=event",
-		"--status=closed",
-		"--json",
-		"--limit=50",
-	)
+	listCmd := exec.Command("bd", closedEventListArgs()...)
 	listOutput, err := listCmd.Output()
 	if err != nil {
 		return "", err
@@ -685,16 +680,35 @@ func findExistingCompactReport(dateStr string) (string, error) {
 	return "", nil
 }
 
+// closedEventListArgs builds the `bd list` arguments both idempotency guards
+// use to find their audit beads.
+//
+// --status=closed is REQUIRED, not cosmetic: audit beads are auto-closed the
+// moment they are created, and `bd list` excludes closed issues by default. The
+// weekly guard omitted it (and used --limit=20), so its query returned nothing,
+// it concluded "no rollup yet", and it mailed the mayor a duplicate on every
+// Monday patrol cycle — three identical rollups for the same week on 2026-10-05
+// (hq-agb9). Measured on the live DB: without the filter 0 events come back;
+// with it, 29, including all 4 weekly rollups.
+//
+// Shared by both guards so they cannot drift apart again — the daily one had
+// carried the correct filter all along, which is why only the weekly misfired.
+func closedEventListArgs() []string {
+	return []string{
+		"list",
+		"--type=event",
+		"--status=closed",
+		"--json",
+		"--limit=50",
+	}
+}
+
 // findExistingWeeklyRollup checks if a weekly rollup already exists for the given week.
 // Returns the bead ID if found, empty string if not found.
 func findExistingWeeklyRollup(weekStart, weekEnd string) (string, error) {
 	expectedTitle := fmt.Sprintf("Weekly Compaction Rollup %s to %s", weekStart, weekEnd)
 
-	listCmd := exec.Command("bd", "list",
-		"--type=event",
-		"--json",
-		"--limit=20",
-	)
+	listCmd := exec.Command("bd", closedEventListArgs()...)
 	listOutput, err := listCmd.Output()
 	if err != nil {
 		return "", err
