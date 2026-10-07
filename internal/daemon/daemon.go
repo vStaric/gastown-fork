@@ -105,6 +105,13 @@ type Daemon struct {
 	// Restart tracking with exponential backoff to prevent crash loops
 	restartTracker *RestartTracker
 
+	// Throttle state for the empty-agent-bead report (hq-89wn). Guards against
+	// re-flooding the log with the condition that produced 20,016 lines in five
+	// days; see reportNoAgentBeads.
+	noAgentBeadsMu       sync.Mutex
+	noAgentBeadsLoggedAt time.Time
+	noAgentBeadsFirstAt  time.Time
+
 	// telemetry exports metrics and logs to VictoriaMetrics / VictoriaLogs.
 	// Nil when telemetry is disabled (GT_OTEL_METRICS_URL / GT_OTEL_LOGS_URL not set).
 	otelProvider *telemetry.Provider

@@ -981,6 +981,50 @@ func identityToBDActor(identity string) string {
 // Defined in constants package — this alias avoids updating all call sites.
 const GUPPViolationTimeout = constants.GUPPViolationTimeout
 
+// ErrNoAgentBeads reports that the agent-bead listing came back empty.
+//
+// This is a STATE, not a listing failure, and the two need different responses.
+// An empty listing means every consumer that resolves an agent by bead is blind:
+// the GUPP (hooked-work-not-running) and orphaned-work checks have no rows to
+// examine, so they cannot detect a stalled polecat at all. Reporting it as a
+// per-run "Warning: listing agent beads failed" buries that: the daemon logged
+// it 20,016 times over five days (~6k/day) while both checks sat dead and
+// nobody could see the signal in the noise (hq-89wn).
+var ErrNoAgentBeads = errors.New("no agent beads found")
+
+// noAgentBeadsLogInterval throttles the empty-listing report. Long enough that
+// a sustained outage produces a readable trail rather than a flood, short
+// enough that the condition is never invisible.
+const noAgentBeadsLogInterval = 1 * time.Hour
+
+// reportNoAgentBeads logs the empty-agent-bead state at most once per
+// noAgentBeadsLogInterval, and says what it BREAKS rather than just what failed.
+//
+// Deliberately not silent: an earlier comment at the GUPP call site claimed the
+// warning was suppressed "when there are simply no agent beads", but the code
+// logged unconditionally — and silence would be worse anyway, because a town
+// with live sessions and zero agent beads is broken, not quiet.
+func (d *Daemon) reportNoAgentBeads(check string) {
+	d.noAgentBeadsMu.Lock()
+	last := d.noAgentBeadsLoggedAt
+	first := d.noAgentBeadsFirstAt
+	if first.IsZero() {
+		first = time.Now()
+		d.noAgentBeadsFirstAt = first
+	}
+	due := time.Since(last) >= noAgentBeadsLogInterval
+	if due {
+		d.noAgentBeadsLoggedAt = time.Now()
+	}
+	d.noAgentBeadsMu.Unlock()
+
+	if !due {
+		return
+	}
+	d.logger.Printf("AGENT BEADS MISSING: no open gt:agent bead in any rig — the %s check cannot run and will not detect a stalled polecat or orphaned work. Been this way since %s. Check whether the reaper stale-closed them (`bd list --label gt:agent --all`); live agents need their bead reopened.",
+		check, first.Format("2006-01-02 15:04"))
+}
+
 // listAgentBeadsJSON queries both the issues and wisps tables for agent beads
 // and unmarshals the combined results into the provided slice pointer.
 // The wisps query is best-effort (gracefully ignored if table doesn't exist).
@@ -1007,7 +1051,7 @@ func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
 		if issuesErr != nil {
 			return fmt.Errorf("bd list failed: %w", issuesErr)
 		}
-		return fmt.Errorf("no agent beads found")
+		return ErrNoAgentBeads
 	}
 
 	return json.Unmarshal(combined, dest)
@@ -1101,7 +1145,10 @@ func (d *Daemon) checkRigGUPPViolations(rigName string) {
 	}
 
 	if err := d.listAgentBeadsJSON(&agents); err != nil {
-		// Suppress warning when there are simply no agent beads (expected when all rigs are docked)
+		if errors.Is(err, ErrNoAgentBeads) {
+			d.reportNoAgentBeads("GUPP")
+			return
+		}
 		d.logger.Printf("Warning: listing agent beads failed for GUPP check: %v", err)
 		return
 	}
@@ -1216,6 +1263,10 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {
 	}
 
 	if err := d.listAgentBeadsJSON(&agents); err != nil {
+		if errors.Is(err, ErrNoAgentBeads) {
+			d.reportNoAgentBeads("orphaned work")
+			return
+		}
 		d.logger.Printf("Warning: listing agent beads failed for orphaned work check: %v", err)
 		return
 	}
